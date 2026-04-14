@@ -1,0 +1,45 @@
+[package]
+name = "ocwatch"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ocwatch"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# HTTP client (NO openssl — use rustls for cross-compile)
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+reqwest-eventsource = "0.6"
+
+# Async traits and streams
+async-trait = "0.1"
+futures = "0.3"
+
+# Error handling
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Unix utilities (PID, signals)
+nix = { version = "0.29", features = ["process", "signal"] }
+
+# XDG directory paths
+dirs = "5"
