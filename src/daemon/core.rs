@@ -192,13 +192,20 @@ impl DaemonCore {
             self.record_recent_dir(host, &active.directory, active.time_updated_ms);
             let inferred_state = active.inferred_state.clone();
             let state = match &statuses {
-                Some(statuses) => statuses
-                    .get(&active.session_id)
-                    .and_then(|status| status.status.as_deref())
-                    .map(SessionState::from_oc_str)
-                    .or(inferred_state.clone())
-                    .unwrap_or(SessionState::Idle),
-                None => inferred_state.unwrap_or(SessionState::Disconnected),
+                Some(statuses) => {
+                    let api_state = statuses
+                        .get(&active.session_id)
+                        .and_then(|status| status.status.as_deref())
+                        .map(SessionState::from_oc_str);
+
+                    match api_state {
+                        Some(SessionState::Unknown) | None => {
+                            inferred_state.clone().unwrap_or(SessionState::Unknown)
+                        }
+                        Some(state) => state,
+                    }
+                }
+                None => inferred_state.unwrap_or(SessionState::Unknown),
             };
             let key = format!("{}:{}", host, active.session_id);
             seen_keys.insert(key.clone());
@@ -218,6 +225,7 @@ impl DaemonCore {
                 id: active.session_id.clone(),
                 host: host.to_string(),
                 state: state.clone(),
+                parent_id: active.parent_id.clone(),
                 title: active.title.clone(),
                 working_dir: active.directory.clone(),
                 activity_age_secs,
