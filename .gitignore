@@ -3,3 +3,8 @@
 .DS_Store
 *.pid
 *.sock
+
+# AI & Tools
+.serena
+.sisyphus
+memory.md

@@ -43,6 +43,7 @@ pub fn handle_drop_in(session: &SessionInfo) -> DropInAction {
                 ssh_target: session.host.clone(),
                 tmux_session: tmux_session.clone(),
                 tmux_window: tmux_window.clone(),
+                tmux_pane: tmux_pane.clone(),
             }
         }
     } else if session.host != "local" {
@@ -64,6 +65,7 @@ pub enum DropInAction {
         ssh_target: String,
         tmux_session: String,
         tmux_window: String,
+        tmux_pane: String,
     },
     RemoteSsh {
         ssh_target: String,
@@ -101,8 +103,11 @@ impl DropInAction {
                 ssh_target,
                 tmux_session,
                 tmux_window,
+                tmux_pane,
             } => {
-                let attach_cmd = format!("tmux attach -t {}:{}", tmux_session, tmux_window);
+                let target = format!("{}:{}.{}", tmux_session, tmux_window, tmux_pane);
+                let escaped_target = target.replace('\'', "'\\''");
+                let attach_cmd = format!("tmux attach -t '{}'", escaped_target);
                 let _ = std::process::Command::new("ssh")
                     .args(["-t", &ssh_target, &attach_cmd])
                     .status();

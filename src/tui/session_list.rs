@@ -9,6 +9,13 @@ use ratatui::{
 use crate::tui::app::App;
 use crate::types::{SessionInfo, SessionState};
 
+pub fn ordered_session_indices(sessions: &[SessionInfo]) -> Vec<usize> {
+    group_session_indices_by_host(sessions)
+        .into_iter()
+        .flat_map(|(_, indices)| indices)
+        .collect()
+}
+
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered()
         .title(" Sessions ")
@@ -53,21 +60,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn build_session_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>) {
-    let mut by_host: Vec<(String, Vec<(usize, &SessionInfo)>)> = Vec::new();
-    for (idx, session) in app.sessions.iter().enumerate() {
-        if let Some(group) = by_host.iter_mut().find(|(h, _)| h == &session.host) {
-            group.1.push((idx, session));
-        } else {
-            by_host.push((session.host.clone(), vec![(idx, session)]));
-        }
-    }
+    let by_host = group_session_indices_by_host(&app.sessions);
 
     let mut items = Vec::new();
     let mut visual_to_session: Vec<Option<usize>> = Vec::new();
 
-    for (host, sessions) in by_host {
+    for (host, session_indices) in by_host {
         let header = Line::from(vec![Span::styled(
-            format!("▼ {} ({})", host, sessions.len()),
+            format!("▼ {} ({})", host, session_indices.len()),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -75,7 +75,8 @@ fn build_session_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>
         items.push(ListItem::new(header));
         visual_to_session.push(None);
 
-        for (idx, session) in sessions {
+        for idx in session_indices {
+            let session = &app.sessions[idx];
             let (icon, color) = state_icon_color(&session.state);
             let title = truncate(&session.title, 38);
             let line = Line::from(vec![
@@ -90,6 +91,20 @@ fn build_session_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>
     }
 
     (items, visual_to_session)
+}
+
+fn group_session_indices_by_host(sessions: &[SessionInfo]) -> Vec<(String, Vec<usize>)> {
+    let mut by_host: Vec<(String, Vec<usize>)> = Vec::new();
+
+    for (idx, session) in sessions.iter().enumerate() {
+        if let Some(group) = by_host.iter_mut().find(|(host, _)| host == &session.host) {
+            group.1.push(idx);
+        } else {
+            by_host.push((session.host.clone(), vec![idx]));
+        }
+    }
+
+    by_host
 }
 
 fn state_icon_color(state: &SessionState) -> (&'static str, Color) {

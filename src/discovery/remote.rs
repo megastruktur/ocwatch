@@ -1,7 +1,7 @@
 use anyhow::Result;
-use crate::discovery::{ActiveSession, DiscoveredInstance, ScanResult, discover_port_from_lsof, discover_port_from_proc_net_tcp};
+use crate::discovery::{ActiveSession, DiscoveredInstance, ScanResult, TmuxPane, discover_port_from_lsof};
 use crate::ssh::SshManager;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 struct RemoteProcess {
@@ -34,6 +34,11 @@ async fn try_scan_remote_v2(
     host_name: &str,
 ) -> Result<ScanResult> {
     let previous_remote_ports = ssh_manager.forwarded_remote_ports(host_name);
+    let tmux_panes_by_tty = fetch_remote_tmux_panes(ssh_manager, host_name)
+        .await
+        .into_iter()
+        .map(|pane| (pane.pane_tty.clone(), pane))
+        .collect::<HashMap<_, _>>();
 
     let ps_output = ssh_manager.exec(host_name, "ps aux").await?;
     let oc_processes: Vec<RemoteProcess> = ps_output
@@ -54,7 +59,7 @@ async fn try_scan_remote_v2(
     let mut current_remote_ports = HashSet::new();
 
     for proc in &oc_processes {
-        let lsof_cmd = format!("lsof -p {} -i -P -n 2>/dev/null || true", proc.pid);
+        let lsof_cmd = format!("lsof -a -p {} -i -P -n 2>/dev/null || true", proc.pid);
         let lsof_output = ssh_manager.exec(host_name, &lsof_cmd).await.unwrap_or_default();
 
         let remote_port = discover_port_from_lsof(&lsof_output)
@@ -80,34 +85,15 @@ async fn try_scan_remote_v2(
                 }
             }
         } else {
-            // No LISTEN port → TUI process
-            // Try /proc/net/tcp before classifying as TUI
-            let proc_tcp = ssh_manager
-                .exec(host_name, &format!(
-                    "cat /proc/{}/net/tcp 2>/dev/null || cat /proc/net/tcp 2>/dev/null || true",
-                    proc.pid
-                ))
-                .await
-                .unwrap_or_default();
-
-            if let Some(port) = discover_port_from_proc_net_tcp(&proc_tcp, proc.pid) {
-                current_remote_ports.insert(port);
-                match ssh_manager.forward_port(host_name, port).await {
-                    Ok(local_port) => {
-                        server_port = Some(local_port);
-                        server_remote_port = Some(port);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to forward port {} for {}: {}", port, host_name, e);
-                    }
-                }
-            } else {
-                tui_pids.push(proc.pid);
-            }
+            // No reliable port signal → treat as a TUI process.
+            // /proc/<pid>/net/tcp is network-namespace scoped on Linux, not process scoped,
+            // so using it here misclassifies unrelated listeners as belonging to this PID.
+            tui_pids.push(proc.pid);
         }
     }
 
     let mut active_sessions = Vec::new();
+    let mut seen_session_ids = HashSet::new();
 
     for pid in &tui_pids {
         let cwd_cmd = format!(
@@ -149,18 +135,27 @@ async fn try_scan_remote_v2(
             continue;
         }
 
+        let session_id = parts[0].to_string();
+        if !seen_session_ids.insert(session_id.clone()) {
+            continue;
+        }
+
+        let tmux_pane = get_remote_process_tty(ssh_manager, host_name, *pid)
+            .await
+            .and_then(|tty| tmux_panes_by_tty.get(&tty).cloned());
+
         active_sessions.push(ActiveSession {
-            session_id: parts[0].to_string(),
+            session_id,
             title: parts[1].to_string(),
             directory: parts[2].to_string(),
             project_id: project_id.clone(),
             time_updated_ms: parts[3].parse().unwrap_or(0),
             tui_pid: *pid,
-            tmux_session: None,
-            tmux_window: None,
-            tmux_window_index: None,
-            tmux_pane_index: None,
-            tmux_pane_tty: None,
+            tmux_session: tmux_pane.as_ref().map(|pane| pane.session_name.clone()),
+            tmux_window: tmux_pane.as_ref().map(|pane| pane.window_name.clone()),
+            tmux_window_index: tmux_pane.as_ref().map(|pane| pane.window_index),
+            tmux_pane_index: tmux_pane.as_ref().map(|pane| pane.pane_index),
+            tmux_pane_tty: tmux_pane.as_ref().map(|pane| pane.pane_tty.clone()),
         });
     }
 
@@ -185,6 +180,54 @@ fn parse_ps_line(line: &str) -> Option<RemoteProcess> {
     let pid: u32 = parts.get(1)?.parse().ok()?;
     let cmdline = parts[10..].join(" ");
     Some(RemoteProcess { pid, cmdline })
+}
+
+async fn fetch_remote_tmux_panes(ssh_manager: &SshManager, host_name: &str) -> Vec<TmuxPane> {
+    let tmux_cmd = "tmux list-panes -a -F '#{pane_pid}\t#{session_name}\t#{window_name}\t#{window_index}\t#{pane_index}\t#{pane_current_command}\t#{pane_tty}' 2>/dev/null || true";
+    let output = ssh_manager.exec(host_name, tmux_cmd).await.unwrap_or_default();
+    parse_remote_tmux_output(&output)
+}
+
+fn parse_remote_tmux_output(raw: &str) -> Vec<TmuxPane> {
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(7, '\t').collect();
+            if parts.len() < 7 {
+                return None;
+            }
+
+            Some(TmuxPane {
+                pane_pid: parts[0].parse().ok()?,
+                session_name: parts[1].to_string(),
+                window_name: parts[2].to_string(),
+                window_index: parts[3].parse().ok()?,
+                pane_index: parts[4].parse().ok()?,
+                pane_current_command: parts[5].to_string(),
+                pane_tty: parts[6].trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+async fn get_remote_process_tty(
+    ssh_manager: &SshManager,
+    host_name: &str,
+    pid: u32,
+) -> Option<String> {
+    let tty_cmd = format!("ps -p {} -o tty= 2>/dev/null | tr -d ' '", pid);
+    let tty = ssh_manager.exec(host_name, &tty_cmd).await.ok()?;
+    let tty = tty.trim();
+
+    if tty.is_empty() || tty == "?" {
+        return None;
+    }
+
+    if tty.starts_with("/dev/") {
+        Some(tty.to_string())
+    } else {
+        Some(format!("/dev/{}", tty))
+    }
 }
 
 fn extract_port_from_cmdline(cmdline: &str) -> Option<u16> {

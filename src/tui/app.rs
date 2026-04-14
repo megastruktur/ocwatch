@@ -82,13 +82,31 @@ impl App {
     }
 
     pub fn move_down(&mut self) {
-        if !self.sessions.is_empty() {
-            self.selected_index = (self.selected_index + 1).min(self.sessions.len() - 1);
+        let ordered = crate::tui::session_list::ordered_session_indices(&self.sessions);
+        if ordered.is_empty() {
+            return;
         }
+
+        let current_pos = ordered
+            .iter()
+            .position(|&idx| idx == self.selected_index)
+            .unwrap_or(0);
+        let next_pos = (current_pos + 1).min(ordered.len() - 1);
+        self.selected_index = ordered[next_pos];
     }
 
     pub fn move_up(&mut self) {
-        self.selected_index = self.selected_index.saturating_sub(1);
+        let ordered = crate::tui::session_list::ordered_session_indices(&self.sessions);
+        if ordered.is_empty() {
+            return;
+        }
+
+        let current_pos = ordered
+            .iter()
+            .position(|&idx| idx == self.selected_index)
+            .unwrap_or(0);
+        let prev_pos = current_pos.saturating_sub(1);
+        self.selected_index = ordered[prev_pos];
     }
 
     async fn send_to_daemon(&self, msg: ClientMessage) {
@@ -280,9 +298,7 @@ async fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
 fn handle_daemon_message(app: &mut App, msg: DaemonMessage) {
     match msg {
         DaemonMessage::StateSnapshot { sessions, hosts } => {
-            app.sessions = sessions;
-            app.hosts = hosts;
-            clamp_index(app);
+            replace_sessions(app, sessions, hosts);
         }
         DaemonMessage::SessionUpdated { session } => {
             if let Some(existing) = app.sessions.iter_mut().find(|s| s.id == session.id) {
@@ -305,11 +321,29 @@ fn handle_daemon_message(app: &mut App, msg: DaemonMessage) {
         DaemonMessage::DaemonStatus {
             sessions, hosts, ..
         } => {
-            app.sessions = sessions;
-            app.hosts = hosts;
-            clamp_index(app);
+            replace_sessions(app, sessions, hosts);
         }
     }
+}
+
+fn replace_sessions(app: &mut App, sessions: Vec<SessionInfo>, hosts: Vec<HostStatus>) {
+    let selected_session_id = app.selected_session().map(|session| session.id.clone());
+
+    app.sessions = sessions;
+    app.hosts = hosts;
+
+    if let Some(selected_session_id) = selected_session_id {
+        if let Some(selected_index) = app
+            .sessions
+            .iter()
+            .position(|session| session.id == selected_session_id)
+        {
+            app.selected_index = selected_index;
+            return;
+        }
+    }
+
+    clamp_index(app);
 }
 
 fn clamp_index(app: &mut App) {
