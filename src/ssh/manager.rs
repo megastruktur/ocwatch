@@ -154,8 +154,12 @@ impl SshManager {
         matches!(result, Ok(out) if out.status.success())
     }
 
-    /// Execute a command on a remote host via existing ControlMaster connection.
-    pub async fn exec(&self, host_name: &str, command: &str) -> Result<String> {
+    pub fn build_command_args(
+        &self,
+        host_name: &str,
+        interactive: bool,
+        remote_command: Option<&str>,
+    ) -> Result<(String, Vec<String>)> {
         let conn = self
             .connections
             .get(host_name)
@@ -167,18 +171,43 @@ impl SshManager {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("No ssh_target for {}", host_name))?;
 
+        let mut args = vec![
+            "-o".to_string(),
+            format!("ControlPath={}", conn.control_path.display()),
+            "-o".to_string(),
+            "ControlMaster=no".to_string(),
+        ];
+
+        if interactive {
+            args.push("-t".to_string());
+        }
+
+        if let Some(port) = conn.host_config.ssh_port {
+            args.push("-p".to_string());
+            args.push(port.to_string());
+        }
+
+        if let Some(identity) = &conn.host_config.ssh_identity {
+            args.push("-i".to_string());
+            args.push(identity.display().to_string());
+        }
+
+        args.push(ssh_target.to_string());
+
+        if let Some(remote_command) = remote_command {
+            args.push(remote_command.to_string());
+        }
+
+        Ok(("ssh".to_string(), args))
+    }
+
+    /// Execute a command on a remote host via existing ControlMaster connection.
+    pub async fn exec(&self, host_name: &str, command: &str) -> Result<String> {
+        let (program, args) = self.build_command_args(host_name, false, Some(command))?;
+
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            Command::new("ssh")
-                .args([
-                    "-o",
-                    &format!("ControlPath={}", conn.control_path.display()),
-                    "-o",
-                    "ControlMaster=no",
-                    ssh_target,
-                    command,
-                ])
-                .output(),
+            Command::new(&program).args(&args).output(),
         )
         .await
         .context("SSH exec timed out")?

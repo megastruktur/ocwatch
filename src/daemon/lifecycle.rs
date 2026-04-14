@@ -4,33 +4,28 @@ use std::time::Duration;
 
 /// Returns the path to the daemon's Unix socket.
 pub fn socket_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("ocwatch")
-        .join("ocwatch.sock")
+    data_dir().join("ocwatch.sock")
 }
 
 /// Returns the path to the daemon's PID file.
 pub fn pid_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("ocwatch")
-        .join("ocwatch.pid")
+    data_dir().join("ocwatch.pid")
 }
 
 /// Returns the path to the daemon's log file.
 pub fn log_path() -> PathBuf {
+    data_dir().join("daemon.log")
+}
+
+pub fn data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("ocwatch")
-        .join("daemon.log")
 }
 
 /// Ensure the ocwatch data directory exists.
 fn ensure_data_dir() -> Result<PathBuf> {
-    let dir = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("ocwatch");
+    let dir = data_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create data directory: {:?}", dir))?;
     Ok(dir)

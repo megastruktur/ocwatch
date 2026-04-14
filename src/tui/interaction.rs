@@ -1,127 +1,263 @@
-use crate::ipc::ClientMessage;
-use crate::types::{SessionInfo, SessionState};
+use crate::ipc::AttachSpec;
 
-/// Handle approve action from TUI (user pressed 'a').
-/// Returns a status message to display.
-pub async fn handle_approve(
-    session: &SessionInfo,
-    daemon_tx: &tokio::sync::mpsc::Sender<ClientMessage>,
-) -> String {
-    if session.state != SessionState::WaitingForPermission {
-        return "Nothing to approve (session not waiting for permission)".to_string();
+pub fn execute_attach(attach: AttachSpec) -> Option<String> {
+    match attach {
+        AttachSpec::LocalTmux {
+            session,
+            window,
+            pane,
+        } => execute_local_tmux_attach(&session, window.as_deref(), pane.as_deref()),
+        AttachSpec::Exec {
+            program,
+            args,
+            tmux_window_name,
+        } => execute_exec_attach(&program, &args, tmux_window_name.as_deref()),
+    }
+}
+
+fn execute_local_tmux_attach(
+    session: &str,
+    window: Option<&str>,
+    pane: Option<&str>,
+) -> Option<String> {
+    if std::env::var_os("TMUX").is_some() {
+        let target = match (window, pane) {
+            (Some(window), Some(pane)) => format!("{}:{}.{}", session, window, pane),
+            _ => session.to_string(),
+        };
+
+        let result = std::process::Command::new("tmux")
+            .args(["switch-client", "-t", &target])
+            .status();
+        if result.map(|status| status.success()).unwrap_or(false) {
+            return None;
+        }
+
+        return Some(format!("tmux switch-client failed for {}", target));
     }
 
-    let msg = ClientMessage::Approve {
-        session_id: session.id.clone(),
+    let result = std::process::Command::new("tmux")
+        .args(["attach-session", "-t", session])
+        .status();
+
+    if result.map(|status| status.success()).unwrap_or(false) {
+        None
+    } else {
+        Some(format!("tmux attach-session failed for {}", session))
+    }
+}
+
+fn execute_exec_attach(
+    program: &str,
+    args: &[String],
+    tmux_window_name: Option<&str>,
+) -> Option<String> {
+    if std::env::var_os("TMUX").is_some() {
+        if let Some(window_name) = tmux_window_name {
+            let shell_command = shell_join(program, args);
+            let result = std::process::Command::new("tmux")
+                .args(["new-window", "-n", window_name, &shell_command])
+                .status();
+
+            if result.map(|status| status.success()).unwrap_or(false) {
+                return None;
+            }
+
+            return Some(format!("tmux new-window failed for {}", window_name));
+        }
+    }
+
+    if let Some(window_name) = tmux_window_name {
+        return execute_exec_attach_with_tmux_wrapper(program, args, window_name);
+    }
+
+    execute_direct_attach(program, args, None)
+}
+
+fn execute_exec_attach_with_tmux_wrapper(
+    program: &str,
+    args: &[String],
+    tmux_window_name: &str,
+) -> Option<String> {
+    let current_exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => return Some(format!("Failed to resolve current executable: {}", error)),
     };
 
-    match daemon_tx.send(msg).await {
-        Ok(_) => format!(
-            "Approved: {}",
-            session.title.chars().take(40).collect::<String>()
-        ),
-        Err(_) => "Failed to send approve request".to_string(),
-    }
-}
+    let current_exe = match current_exe.to_str() {
+        Some(path) => path,
+        None => return Some("Current executable path is not valid UTF-8".to_string()),
+    };
 
-/// Handle drop-in action from TUI (user pressed Enter).
-/// Returns the action to execute (local tmux switch, remote SSH, etc).
-pub fn handle_drop_in(session: &SessionInfo) -> DropInAction {
-    if let (Some(tmux_session), Some(tmux_window), Some(tmux_pane)) = (
-        &session.tmux_session,
-        &session.tmux_window,
-        &session.tmux_pane,
-    ) {
-        if session.host == "local" {
-            DropInAction::LocalTmux {
-                session: tmux_session.clone(),
-                window: tmux_window.clone(),
-                pane: tmux_pane.clone(),
-            }
-        } else {
-            DropInAction::RemoteTmux {
-                ssh_target: session.host.clone(),
-                tmux_session: tmux_session.clone(),
-                tmux_window: tmux_window.clone(),
-                tmux_pane: tmux_pane.clone(),
-            }
+    let wrapper_session = format!("ocwatch-return-{}", std::process::id());
+    let remote_window = sanitize_tmux_name(tmux_window_name);
+    let remote_command = wrap_remote_command(&shell_join(program, args));
+    let ocwatch_command = shell_escape(current_exe);
+
+    let create_session = std::process::Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &wrapper_session,
+            "-n",
+            "ocwatch",
+            &ocwatch_command,
+        ])
+        .status();
+
+    match create_session {
+        Ok(status) if status.success() => {}
+        Ok(_) | Err(_) => {
+            return execute_direct_attach(
+                program,
+                args,
+                Some("local tmux unavailable; running remote attach directly"),
+            );
         }
-    } else if session.host != "local" {
-        DropInAction::RemoteSsh {
-            ssh_target: session.host.clone(),
-        }
+    }
+
+    let disable_prefix = std::process::Command::new("tmux")
+        .args(["set-option", "-t", &wrapper_session, "prefix", "None"])
+        .status();
+
+    if !disable_prefix
+        .map(|status| status.success())
+        .unwrap_or(false)
+    {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &wrapper_session])
+            .status();
+        return Some(format!(
+            "tmux set-option prefix failed for {}",
+            wrapper_session
+        ));
+    }
+
+    let disable_prefix2 = std::process::Command::new("tmux")
+        .args(["set-option", "-t", &wrapper_session, "prefix2", "None"])
+        .status();
+
+    if !disable_prefix2
+        .map(|status| status.success())
+        .unwrap_or(false)
+    {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &wrapper_session])
+            .status();
+        return Some(format!(
+            "tmux set-option prefix2 failed for {}",
+            wrapper_session
+        ));
+    }
+
+    let mut create_window_cmd = std::process::Command::new("tmux");
+    create_window_cmd.args([
+        "new-window",
+        "-t",
+        &wrapper_session,
+        "-n",
+        &remote_window,
+        "sh",
+        "-lc",
+    ]);
+    create_window_cmd.arg(&remote_command);
+    let create_window = create_window_cmd.status();
+
+    if !create_window
+        .map(|status| status.success())
+        .unwrap_or(false)
+    {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &wrapper_session])
+            .status();
+        return Some(format!("tmux new-window failed for {}", remote_window));
+    }
+
+    let attach_result = std::process::Command::new("tmux")
+        .args([
+            "attach-session",
+            "-t",
+            &format!("{}:{}", wrapper_session, remote_window),
+        ])
+        .status();
+
+    if attach_result
+        .map(|status| status.success())
+        .unwrap_or(false)
+    {
+        None
     } else {
-        DropInAction::NoTmux
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &wrapper_session])
+            .status();
+        Some(format!(
+            "tmux attach-session failed for {}",
+            wrapper_session
+        ))
     }
 }
 
-pub enum DropInAction {
-    LocalTmux {
-        session: String,
-        window: String,
-        pane: String,
-    },
-    RemoteTmux {
-        ssh_target: String,
-        tmux_session: String,
-        tmux_window: String,
-        tmux_pane: String,
-    },
-    RemoteSsh {
-        ssh_target: String,
-    },
-    NoTmux,
+fn execute_direct_attach(
+    program: &str,
+    args: &[String],
+    status_note: Option<&str>,
+) -> Option<String> {
+    if let Some(status_note) = status_note {
+        eprintln!("{}", status_note);
+    }
+
+    let result = std::process::Command::new(program).args(args).status();
+    if result.map(|status| status.success()).unwrap_or(false) {
+        None
+    } else {
+        Some(format!("{} failed", program))
+    }
 }
 
-impl DropInAction {
-    /// Execute the drop-in action. Returns a status message if action failed.
-    pub fn execute(self) -> Option<String> {
-        match self {
-            DropInAction::LocalTmux {
-                session,
-                window,
-                pane,
-            } => {
-                let target = format!("{}:{}.{}", session, window, pane);
-                let result = std::process::Command::new("tmux")
-                    .args(["switch-client", "-t", &target])
-                    .status();
-                if result.map(|s| s.success()).unwrap_or(false) {
-                    None
-                } else {
-                    // Fallback: select window + pane individually
-                    let _ = std::process::Command::new("tmux")
-                        .args(["select-window", "-t", &format!("{}:{}", session, window)])
-                        .status();
-                    let _ = std::process::Command::new("tmux")
-                        .args(["select-pane", "-t", &format!(".{}", pane)])
-                        .status();
-                    None
-                }
-            }
-            DropInAction::RemoteTmux {
-                ssh_target,
-                tmux_session,
-                tmux_window,
-                tmux_pane,
-            } => {
-                let target = format!("{}:{}.{}", tmux_session, tmux_window, tmux_pane);
-                let escaped_target = target.replace('\'', "'\\''");
-                let attach_cmd = format!("tmux attach -t '{}'", escaped_target);
-                let _ = std::process::Command::new("ssh")
-                    .args(["-t", &ssh_target, &attach_cmd])
-                    .status();
-                None
-            }
-            DropInAction::RemoteSsh { ssh_target } => {
-                let _ = std::process::Command::new("ssh")
-                    .args(["-t", &ssh_target])
-                    .status();
-                None
-            }
-            DropInAction::NoTmux => {
-                Some("No tmux info — cannot drop in to this session".to_string())
-            }
-        }
+fn shell_join(program: &str, args: &[String]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(shell_escape(program));
+    parts.extend(args.iter().map(|arg| shell_escape(arg)));
+    parts.join(" ")
+}
+
+fn shell_escape(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
     }
+
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '@'))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn sanitize_tmux_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '-',
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+
+    if sanitized.is_empty() {
+        "remote".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn wrap_remote_command(command: &str) -> String {
+    format!(
+        "{command}; status=$?; if [ $status -ne 0 ]; then printf '\\nremote drop-in exited with status %s\\n' \"$status\"; sleep 5; fi; exit $status",
+        command = command,
+    )
 }

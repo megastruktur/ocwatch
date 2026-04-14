@@ -5,6 +5,27 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use crate::types::{HostStatus, SessionInfo};
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecentDirEntry {
+    pub host: String,
+    pub directory: String,
+    pub last_seen_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum AttachSpec {
+    LocalTmux {
+        session: String,
+        window: Option<String>,
+        pane: Option<String>,
+    },
+    Exec {
+        program: String,
+        args: Vec<String>,
+        tmux_window_name: Option<String>,
+    },
+}
+
 // ─── Message Types ────────────────────────────────────────────────────────────
 
 /// Messages sent FROM the daemon TO connected clients.
@@ -39,6 +60,13 @@ pub enum DaemonMessage {
         hosts: Vec<HostStatus>,
         sessions: Vec<SessionInfo>,
     },
+    RecentDirs {
+        entries: Vec<RecentDirEntry>,
+        is_complete: bool,
+    },
+    AttachReady {
+        attach: AttachSpec,
+    },
 }
 
 /// Messages sent FROM clients TO the daemon.
@@ -57,6 +85,16 @@ pub enum ClientMessage {
     },
     /// Force re-scan all hosts.
     RefreshAll,
+    /// Request a unified recent directory list.
+    GetRecentDirs {
+        limit: u8,
+    },
+    /// Create a tmux session on a host and launch opencode.
+    CreateSession {
+        host: String,
+        directory: String,
+        name_hint: Option<String>,
+    },
     /// Gracefully stop the daemon.
     Shutdown,
     /// Request current DaemonStatus (for 'daemon status' CLI command).

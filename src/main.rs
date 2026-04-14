@@ -12,6 +12,7 @@ mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(name = "ocwatch")]
@@ -34,6 +35,8 @@ enum Commands {
         /// Session ID to approve
         session_id: String,
     },
+    /// Create a new local tmux session in the current directory and launch opencode
+    New,
     /// Debug utilities (for development and QA)
     Debug {
         #[command(subcommand)]
@@ -106,6 +109,7 @@ async fn main() -> Result<()> {
             DaemonCommands::Run => daemon::lifecycle::run_daemon().await,
         },
         Some(Commands::Approve { session_id }) => run_approve(&session_id).await,
+        Some(Commands::New) => run_new().await,
         Some(Commands::Debug { action }) => match action {
             DebugCommands::ScanLocal => debug_scan_local().await,
             DebugCommands::ScanLocalV2 => debug_scan_local_v2().await,
@@ -160,6 +164,57 @@ async fn run_approve(session_id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_new() -> Result<()> {
+    use anyhow::Context;
+    use tokio::io::BufReader;
+
+    let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
+    let cwd = cwd
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Current directory is not valid UTF-8"))?
+        .to_string();
+    let basename = infer_name_from_directory(&cwd);
+
+    let stream = ipc::connect_to_daemon()
+        .await
+        .context("Failed to connect to daemon")?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    ipc::send_message(
+        &mut write_half,
+        &ipc::ClientMessage::CreateSession {
+            host: "local".to_string(),
+            directory: cwd,
+            name_hint: Some(basename),
+        },
+    )
+    .await
+    .context("Failed to request session creation")?;
+
+    match ipc::read_message::<ipc::DaemonMessage>(&mut reader).await {
+        Ok(Some(ipc::DaemonMessage::AttachReady { attach })) => {
+            if let Some(message) = tui::interaction::execute_attach(attach) {
+                anyhow::bail!(message);
+            }
+            Ok(())
+        }
+        Ok(Some(ipc::DaemonMessage::Error { message })) => anyhow::bail!(message),
+        Ok(Some(other)) => anyhow::bail!("Unexpected daemon response: {}", serde_json::to_string(&other)?),
+        Ok(None) => anyhow::bail!("Daemon closed the connection before returning attach info"),
+        Err(error) => Err(error).context("Failed to read daemon response"),
+    }
+}
+
+fn infer_name_from_directory(directory: &str) -> String {
+    Path::new(directory)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("opencode")
+        .to_string()
 }
 
 async fn debug_scan_local() -> Result<()> {

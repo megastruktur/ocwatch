@@ -3,6 +3,7 @@ use crate::discovery::{
     ActiveSession, DiscoveredInstance, ScanResult, TmuxPane, discover_port_from_lsof,
     infer_session_state_from_part,
 };
+use crate::ipc::RecentDirEntry;
 use crate::ssh::SshManager;
 use std::collections::{HashMap, HashSet};
 
@@ -274,6 +275,42 @@ pub async fn reconcile_port_forwards(
             ssh_manager.unforward_port(host_name, old_port).await;
         }
     }
+}
+
+pub async fn recent_directories(
+    ssh_manager: &SshManager,
+    host_name: &str,
+    limit: usize,
+) -> Vec<RecentDirEntry> {
+    let query = format!(
+        "sqlite3 -separator '|' ~/.local/share/opencode/opencode.db \
+         \"SELECT directory, MAX(time_updated) \
+          FROM session \
+          WHERE parent_id IS NULL AND directory != '' \
+          GROUP BY directory \
+          ORDER BY MAX(time_updated) DESC LIMIT {}\"",
+        limit
+    );
+
+    let output = match ssh_manager.exec(host_name, &query).await {
+        Ok(output) => output,
+        Err(_) => return vec![],
+    };
+
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(2, '|').collect();
+            if parts.len() < 2 || parts[0].trim().is_empty() {
+                return None;
+            }
+            Some(RecentDirEntry {
+                host: host_name.to_string(),
+                directory: parts[0].trim().to_string(),
+                last_seen_unix_ms: parts[1].trim().parse().unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 // ─── Legacy API (kept for debug commands) ─────────────────────────────────────

@@ -1,5 +1,5 @@
 //! TUI application — App struct, event loop, layout skeleton.
-//! Panel content rendering is in session_list.rs, detail.rs, status_bar.rs (Task 12).
+//! Panel content rendering is in session_list.rs, detail.rs, status_bar.rs.
 
 use anyhow::Result;
 use crossterm::{
@@ -10,44 +10,48 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    widgets::Paragraph,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
 use std::collections::HashSet;
 use std::io;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-use crate::ipc::{connect_to_daemon, read_message, send_message, ClientMessage, DaemonMessage};
+use crate::ipc::{
+    connect_to_daemon, read_message, send_message, AttachSpec, ClientMessage, DaemonMessage,
+    RecentDirEntry,
+};
 use crate::types::{HostStatus, SessionInfo};
 
-/// Transient status message shown in status bar.
 struct StatusMsg {
     text: String,
     expires: Instant,
 }
 
-/// Main TUI application state.
+struct RecentDirsModal {
+    entries: Vec<RecentDirEntry>,
+    selected_index: usize,
+    is_complete: bool,
+}
+
 pub struct App {
-    /// Sessions received from daemon.
     pub sessions: Vec<SessionInfo>,
-    /// Host statuses from daemon.
     pub hosts: Vec<HostStatus>,
-    /// Currently selected index in session list.
     pub selected_index: usize,
-    /// Whether the TUI should quit.
     pub should_quit: bool,
-    /// Whether we're connected to the daemon.
     pub daemon_connected: bool,
-    /// Channel to send messages to daemon.
-    daemon_tx: Option<mpsc::Sender<ClientMessage>>,
-    /// Transient status message.
+    daemon_msg_tx: Option<mpsc::Sender<DaemonMessage>>,
     status_msg: Option<StatusMsg>,
-    /// Sessions that recently raised an attention bell and have not been viewed yet.
     attention_session_keys: HashSet<String>,
+    pending_attach: Option<AttachSpec>,
+    recent_dirs_cache: Vec<RecentDirEntry>,
+    recent_dirs_modal: Option<RecentDirsModal>,
 }
 
 impl App {
@@ -58,9 +62,12 @@ impl App {
             selected_index: 0,
             should_quit: false,
             daemon_connected: false,
-            daemon_tx: None,
+            daemon_msg_tx: None,
             status_msg: None,
             attention_session_keys: HashSet::new(),
+            pending_attach: None,
+            recent_dirs_cache: Vec::new(),
+            recent_dirs_modal: None,
         }
     }
 
@@ -72,9 +79,9 @@ impl App {
     }
 
     pub fn current_status_msg(&self) -> Option<&str> {
-        self.status_msg.as_ref().and_then(|m| {
-            if Instant::now() < m.expires {
-                Some(m.text.as_str())
+        self.status_msg.as_ref().and_then(|message| {
+            if Instant::now() < message.expires {
+                Some(message.text.as_str())
             } else {
                 None
             }
@@ -125,10 +132,107 @@ impl App {
         self.clear_attention_for_selected();
     }
 
-    async fn send_to_daemon(&self, msg: ClientMessage) {
-        if let Some(tx) = &self.daemon_tx {
-            let _ = tx.send(msg).await;
+    fn request_daemon(&self, msg: ClientMessage) {
+        let Some(msg_tx) = self.daemon_msg_tx.clone() else {
+            return;
+        };
+
+        tokio::spawn(async move {
+            let stream = match connect_to_daemon().await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = msg_tx
+                        .send(DaemonMessage::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+
+            if let Err(error) = send_message(&mut write_half, &msg).await {
+                let _ = msg_tx
+                    .send(DaemonMessage::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return;
+            }
+
+            loop {
+                match read_message::<DaemonMessage>(&mut reader).await {
+                    Ok(Some(message)) => {
+                        if msg_tx.send(message).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(error) => {
+                        let _ = msg_tx
+                            .send(DaemonMessage::Error {
+                                message: error.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    fn open_recent_dirs_modal(&mut self) {
+        self.recent_dirs_modal = Some(RecentDirsModal {
+            entries: self.recent_dirs_cache.clone(),
+            selected_index: 0,
+            is_complete: false,
+        });
+        self.request_daemon(ClientMessage::GetRecentDirs { limit: 10 });
+    }
+
+    fn close_recent_dirs_modal(&mut self) {
+        self.recent_dirs_modal = None;
+    }
+
+    fn update_recent_dirs(&mut self, entries: Vec<RecentDirEntry>, is_complete: bool) {
+        self.recent_dirs_cache = entries.clone();
+        if let Some(modal) = &mut self.recent_dirs_modal {
+            modal.entries = entries;
+            modal.is_complete = is_complete;
+            if modal.entries.is_empty() {
+                modal.selected_index = 0;
+            } else {
+                modal.selected_index = modal.selected_index.min(modal.entries.len() - 1);
+            }
         }
+    }
+
+    fn move_recent_dirs_down(&mut self) {
+        let Some(modal) = &mut self.recent_dirs_modal else {
+            return;
+        };
+        if modal.entries.is_empty() {
+            return;
+        }
+        modal.selected_index = (modal.selected_index + 1).min(modal.entries.len() - 1);
+    }
+
+    fn move_recent_dirs_up(&mut self) {
+        let Some(modal) = &mut self.recent_dirs_modal else {
+            return;
+        };
+        if modal.entries.is_empty() {
+            return;
+        }
+        modal.selected_index = modal.selected_index.saturating_sub(1);
+    }
+
+    fn selected_recent_dir(&self) -> Option<&RecentDirEntry> {
+        self.recent_dirs_modal
+            .as_ref()
+            .and_then(|modal| modal.entries.get(modal.selected_index))
     }
 }
 
@@ -138,14 +242,11 @@ impl Default for App {
     }
 }
 
-// ─── Main TUI Entry Point ─────────────────────────────────────────────────────
-
-/// Run the TUI. Connects to daemon, then runs the event loop.
 pub async fn run_tui() -> Result<()> {
     let stream = match connect_to_daemon().await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error: {e}");
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("Error: {error}");
             std::process::exit(1);
         }
     };
@@ -162,39 +263,30 @@ pub async fn run_tui() -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    result
+    let pending_attach = result?;
+    if let Some(attach) = pending_attach {
+        if let Some(message) = crate::tui::interaction::execute_attach(attach) {
+            eprintln!("{}", message);
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     stream: UnixStream,
-) -> Result<()> {
+) -> Result<Option<AttachSpec>> {
     let mut app = App::new();
     app.daemon_connected = true;
 
-    let (read_half, write_half) = stream.into_split();
+    let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    // Outbound channel: main loop → daemon writer task
-    let (daemon_tx, mut daemon_rx) = mpsc::channel::<ClientMessage>(32);
-    app.daemon_tx = Some(daemon_tx);
+    send_message(&mut write_half, &ClientMessage::Subscribe).await?;
 
-    // Send initial Subscribe, then hand write_half to the writer task
-    {
-        let mut write_half = write_half;
-        send_message(&mut write_half, &ClientMessage::Subscribe).await?;
-
-        tokio::spawn(async move {
-            while let Some(msg) = daemon_rx.recv().await {
-                if send_message(&mut write_half, &msg).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
-    // Inbound channel: daemon reader task → main loop
     let (msg_tx, mut msg_rx) = mpsc::channel::<DaemonMessage>(64);
+    app.daemon_msg_tx = Some(msg_tx.clone());
 
     tokio::spawn(async move {
         loop {
@@ -213,7 +305,7 @@ async fn run_app(
     let mut last_tick = Instant::now();
 
     loop {
-        terminal.draw(|f| render(f, &app))?;
+        terminal.draw(|frame| render(frame, &app))?;
 
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
@@ -225,7 +317,6 @@ async fn run_app(
             }
         }
 
-        // Drain daemon messages (non-blocking)
         loop {
             match msg_rx.try_recv() {
                 Ok(msg) => handle_daemon_message(&mut app, msg),
@@ -238,11 +329,10 @@ async fn run_app(
             }
         }
 
-        // Periodic tick: clear expired status messages
         if last_tick.elapsed() >= tick_rate {
             last_tick = Instant::now();
-            if let Some(m) = &app.status_msg {
-                if Instant::now() >= m.expires {
+            if let Some(status_msg) = &app.status_msg {
+                if Instant::now() >= status_msg.expires {
                     app.status_msg = None;
                 }
             }
@@ -253,55 +343,57 @@ async fn run_app(
         }
     }
 
-    Ok(())
+    Ok(app.pending_attach)
 }
 
-// ─── Key Handling ──────────────────────────────────────────────────────────────
-
 async fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
+    if app.recent_dirs_modal.is_some() {
+        handle_recent_dirs_key(app, key, modifiers).await;
+        return;
+    }
+
     match key {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
         KeyCode::Char('r') => {
-            app.send_to_daemon(ClientMessage::RefreshAll).await;
+            app.request_daemon(ClientMessage::RefreshAll);
             app.set_status("Refreshing...", Duration::from_secs(2));
         }
         KeyCode::Char('a') => {
             if let Some(session) = app.selected_session() {
-                let session = session.clone();
-                if let Some(tx) = &app.daemon_tx {
-                    let tx = tx.clone();
-                    let msg = crate::tui::interaction::handle_approve(&session, &tx).await;
-                    app.set_status(msg, Duration::from_secs(5));
+                if session.state != crate::types::SessionState::WaitingForPermission {
+                    app.set_status(
+                        "Nothing to approve (session not waiting for permission)",
+                        Duration::from_secs(3),
+                    );
+                    return;
                 }
+
+                app.request_daemon(ClientMessage::Approve {
+                    session_id: session.id.clone(),
+                });
+                app.set_status("Approving...", Duration::from_secs(3));
             } else {
                 app.set_status("No session selected", Duration::from_secs(2));
             }
         }
         KeyCode::Enter => {
             if let Some(session) = app.selected_session() {
-                let action = crate::tui::interaction::handle_drop_in(session);
-                match action {
-                    crate::tui::interaction::DropInAction::NoTmux => {
-                        app.set_status(
-                            "No tmux info — cannot drop in",
-                            Duration::from_secs(3),
-                        );
-                    }
-                    other => {
-                        app.should_quit = true;
-                        if let Some(msg) = other.execute() {
-                            eprintln!("{}", msg);
-                        }
-                    }
-                }
+                app.request_daemon(ClientMessage::DropIn {
+                    session_id: session.id.clone(),
+                });
+                app.set_status("Preparing drop-in...", Duration::from_secs(3));
             }
+        }
+        KeyCode::Char('n') => {
+            app.open_recent_dirs_modal();
+            app.set_status("Loading recent directories...", Duration::from_secs(3));
         }
         KeyCode::Char('?') => {
             app.set_status(
-                "j/k: navigate  a: approve  enter: drop-in  r: refresh  q: quit",
+                "j/k: navigate  n: new  a: approve  enter: drop-in  r: refresh  q: quit",
                 Duration::from_secs(5),
             );
         }
@@ -309,7 +401,30 @@ async fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
     }
 }
 
-// ─── Daemon Message Handling ───────────────────────────────────────────────────
+async fn handle_recent_dirs_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
+    match key {
+        KeyCode::Esc => app.close_recent_dirs_modal(),
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.should_quit = true,
+        KeyCode::Char('j') | KeyCode::Down => app.move_recent_dirs_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.move_recent_dirs_up(),
+        KeyCode::Enter => {
+            let Some(entry) = app.selected_recent_dir().cloned() else {
+                return;
+            };
+            app.close_recent_dirs_modal();
+            app.request_daemon(ClientMessage::CreateSession {
+                host: entry.host.clone(),
+                directory: entry.directory.clone(),
+                name_hint: Some(infer_name_from_directory(&entry.directory)),
+            });
+            app.set_status(
+                format!("Creating session in {}", entry.directory),
+                Duration::from_secs(4),
+            );
+        }
+        _ => {}
+    }
+}
 
 fn handle_daemon_message(app: &mut App, msg: DaemonMessage) {
     match msg {
@@ -320,14 +435,16 @@ fn handle_daemon_message(app: &mut App, msg: DaemonMessage) {
             if !session.state.should_bell() {
                 app.attention_session_keys.remove(&session.key());
             }
-            if let Some(existing) = app.sessions.iter_mut().find(|s| s.id == session.id) {
+            if let Some(existing) = app.sessions.iter_mut().find(|s| s.key() == session.key()) {
                 *existing = session;
             } else {
                 app.sessions.push(session);
             }
         }
         DaemonMessage::Bell {
-            session_id, host, reason,
+            session_id,
+            host,
+            reason,
         } => {
             let key = format!("{}:{}", host, session_id);
             if app
@@ -350,11 +467,24 @@ fn handle_daemon_message(app: &mut App, msg: DaemonMessage) {
         } => {
             replace_sessions(app, sessions, hosts);
         }
+        DaemonMessage::RecentDirs {
+            entries,
+            is_complete,
+        } => {
+            app.update_recent_dirs(entries, is_complete);
+            if is_complete {
+                app.set_status("Recent directories loaded", Duration::from_secs(2));
+            }
+        }
+        DaemonMessage::AttachReady { attach } => {
+            app.pending_attach = Some(attach);
+            app.should_quit = true;
+        }
     }
 }
 
 fn replace_sessions(app: &mut App, sessions: Vec<SessionInfo>, hosts: Vec<HostStatus>) {
-    let selected_session_id = app.selected_session().map(|session| session.id.clone());
+    let selected_session_key = app.selected_session().map(SessionInfo::key);
 
     let live_attention_keys = sessions
         .iter()
@@ -367,11 +497,11 @@ fn replace_sessions(app: &mut App, sessions: Vec<SessionInfo>, hosts: Vec<HostSt
     app.sessions = sessions;
     app.hosts = hosts;
 
-    if let Some(selected_session_id) = selected_session_id {
+    if let Some(selected_session_key) = selected_session_key {
         if let Some(selected_index) = app
             .sessions
             .iter()
-            .position(|session| session.id == selected_session_id)
+            .position(|session| session.key() == selected_session_key)
         {
             app.selected_index = selected_index;
             return;
@@ -389,20 +519,16 @@ fn clamp_index(app: &mut App) {
     }
 }
 
-// ─── Rendering ─────────────────────────────────────────────────────────────────
-
-/// Main render function — lays out the session list, detail panel, and status bar.
-fn render(f: &mut Frame, app: &App) {
-    let area = f.area();
+fn render(frame: &mut Frame, app: &App) {
+    let area = frame.area();
 
     if area.width < 40 || area.height < 10 {
-        let msg =
+        let message =
             Paragraph::new("Terminal too small\n(min 40x10)").style(Style::default().fg(Color::Red));
-        f.render_widget(msg, area);
+        frame.render_widget(message, area);
         return;
     }
 
-    // Vertical split: main content + status bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -411,32 +537,135 @@ fn render(f: &mut Frame, app: &App) {
     let main_area = chunks[0];
     let status_area = chunks[1];
     let min_session_list_height = 4;
-    let max_detail_height = main_area
-        .height
-        .saturating_sub(min_session_list_height)
-        .max(1);
-    let detail_height = crate::tui::detail::desired_height(app, main_area.width)
-        .min(max_detail_height);
+    let max_detail_height = main_area.height.saturating_sub(min_session_list_height).max(1);
+    let detail_height = crate::tui::detail::desired_height(app, main_area.width).min(max_detail_height);
 
-    // Vertical split: session list on top, detail panel below.
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(detail_height)])
         .split(main_area);
 
-    render_session_list(f, app, main_chunks[0]);
-    render_detail(f, app, main_chunks[1]);
-    render_status_bar(f, app, status_area);
+    render_session_list(frame, app, main_chunks[0]);
+    render_detail(frame, app, main_chunks[1]);
+    render_status_bar(frame, app, status_area);
+
+    if app.recent_dirs_modal.is_some() {
+        render_recent_dirs_modal(frame, app, area);
+    }
 }
 
-fn render_session_list(f: &mut Frame, app: &App, area: Rect) {
-    crate::tui::session_list::render(f, app, area);
+fn render_session_list(frame: &mut Frame, app: &App, area: Rect) {
+    crate::tui::session_list::render(frame, app, area);
 }
 
-fn render_detail(f: &mut Frame, app: &App, area: Rect) {
-    crate::tui::detail::render(f, app, area);
+fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
+    crate::tui::detail::render(frame, app, area);
 }
 
-fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    crate::tui::status_bar::render(f, app, area);
+fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+    crate::tui::status_bar::render(frame, app, area);
+}
+
+fn render_recent_dirs_modal(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(modal) = &app.recent_dirs_modal else {
+        return;
+    };
+
+    let width = area.width.min(90).max(40);
+    let height = area.height.min(16).max(8);
+    let popup = centered_rect(width, height, area);
+    let inner = Block::bordered()
+        .title(" New OpenCode Session ")
+        .border_style(Style::default().fg(Color::Cyan))
+        .inner(popup);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::bordered()
+            .title(" New OpenCode Session ")
+            .border_style(Style::default().fg(Color::Cyan)),
+        popup,
+    );
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let subtitle = if modal.is_complete {
+        "Select a recent directory and press Enter"
+    } else {
+        "Loading recent directories..."
+    };
+    frame.render_widget(
+        Paragraph::new(subtitle).style(Style::default().fg(Color::Yellow)),
+        sections[0],
+    );
+
+    if modal.entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No recent directories found yet")
+                .style(Style::default().fg(Color::DarkGray)),
+            sections[1],
+        );
+    } else {
+        let items = modal
+            .entries
+            .iter()
+            .map(|entry| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("[{}] ", entry.host),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(truncate_path(&entry.directory, sections[1].width.saturating_sub(10) as usize)),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let mut state = ListState::default();
+        state.select(Some(modal.selected_index.min(modal.entries.len().saturating_sub(1))));
+        let list = List::new(items)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        frame.render_stateful_widget(list, sections[1], &mut state);
+    }
+
+    frame.render_widget(
+        Paragraph::new("Enter: create + attach  Esc: close")
+            .style(Style::default().fg(Color::DarkGray)),
+        sections[2],
+    );
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect {
+        x,
+        y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
+}
+
+fn infer_name_from_directory(directory: &str) -> String {
+    Path::new(directory)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("opencode")
+        .to_string()
+}
+
+fn truncate_path(path: &str, max: usize) -> String {
+    if max == 0 || path.chars().count() <= max {
+        return path.to_string();
+    }
+
+    let suffix_len = max.saturating_sub(1);
+    format!("…{}", path.chars().rev().take(suffix_len).collect::<String>().chars().rev().collect::<String>())
 }

@@ -2,6 +2,7 @@ use crate::discovery::{
     discover_port_from_lsof, infer_session_state_from_part, parse_tmux_output, ActiveSession,
     DiscoveredInstance, ScanResult,
 };
+use crate::ipc::RecentDirEntry;
 use anyhow::Result;
 use tokio::process::Command;
 
@@ -352,6 +353,42 @@ fn opencode_db_path() -> String {
         return format!("{}/.local/share/opencode/opencode.db", home.display());
     }
     "~/.local/share/opencode/opencode.db".to_string()
+}
+
+pub async fn recent_directories(limit: usize) -> Vec<RecentDirEntry> {
+    let db_path = opencode_db_path();
+    let query = format!(
+        "SELECT directory, MAX(time_updated) \
+         FROM session \
+         WHERE parent_id IS NULL AND directory != '' \
+         GROUP BY directory \
+         ORDER BY MAX(time_updated) DESC LIMIT {}",
+        limit
+    );
+
+    let output = match Command::new("sqlite3")
+        .args(["-separator", "|", &db_path, &query])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return vec![],
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(2, '|').collect();
+            if parts.len() < 2 || parts[0].trim().is_empty() {
+                return None;
+            }
+            Some(RecentDirEntry {
+                host: "local".to_string(),
+                directory: parts[0].trim().to_string(),
+                last_seen_unix_ms: parts[1].trim().parse().unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 async fn query_latest_session(db_path: &str, project_id: &str) -> Option<DbSession> {

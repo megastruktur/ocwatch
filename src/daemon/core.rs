@@ -1,12 +1,15 @@
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
+use tokio::process::Command;
 
 use crate::config::Config;
 use crate::daemon::bell::BellNotifier;
+use crate::daemon::recent_dirs::RecentDirStore;
 use crate::discovery::{local, remote, ActiveSession, ScanResult};
-use crate::ipc::{self, BroadcastTx, ClientMessage, DaemonMessage};
+use crate::ipc::{self, AttachSpec, BroadcastTx, ClientMessage, DaemonMessage, RecentDirEntry};
 use crate::opencode::client::OcClient;
 use crate::ssh::SshManager;
 use crate::types::{HostStatus, SessionInfo, SessionState};
@@ -26,11 +29,15 @@ pub struct DaemonCore {
     broadcast_tx: BroadcastTx,
     started_at: Instant,
     bell_notifier: BellNotifier,
+    recent_dirs: RecentDirStore,
+    recent_dir_cache_path: PathBuf,
 }
 
 impl DaemonCore {
     pub fn new(config: Config) -> Self {
         let (broadcast_tx, _) = ipc::new_broadcast();
+        let recent_dir_cache_path = crate::daemon::lifecycle::data_dir().join("recent_dirs.json");
+        let recent_dirs = RecentDirStore::load(&recent_dir_cache_path).unwrap_or_default();
         DaemonCore {
             config,
             ssh_manager: SshManager::new(),
@@ -40,6 +47,8 @@ impl DaemonCore {
             broadcast_tx,
             started_at: Instant::now(),
             bell_notifier: BellNotifier::new(),
+            recent_dirs,
+            recent_dir_cache_path,
         }
     }
 
@@ -180,6 +189,7 @@ impl DaemonCore {
         };
 
         for active in &scan.active_sessions {
+            self.record_recent_dir(host, &active.directory, active.time_updated_ms);
             let inferred_state = active.inferred_state.clone();
             let state = match &statuses {
                 Some(statuses) => statuses
@@ -274,6 +284,8 @@ impl DaemonCore {
                 error,
             },
         );
+
+        self.persist_recent_dirs();
     }
 
     fn cleanup_stale_sessions(&mut self, host: &str, seen_keys: &HashSet<String>) {
@@ -307,6 +319,254 @@ impl DaemonCore {
             hosts: self.hosts.values().cloned().collect(),
             sessions: self.sessions.values().cloned().collect(),
         }
+    }
+
+    fn persist_recent_dirs(&self) {
+        if let Err(error) = self.recent_dirs.save(&self.recent_dir_cache_path) {
+            tracing::warn!("Failed to persist recent dirs: {}", error);
+        }
+    }
+
+    fn record_recent_dir(&mut self, host: &str, directory: &str, last_seen_unix_ms: u64) {
+        if directory.trim().is_empty() {
+            return;
+        }
+        self.recent_dirs.upsert(RecentDirEntry {
+            host: host.to_string(),
+            directory: directory.to_string(),
+            last_seen_unix_ms,
+        });
+    }
+
+    fn configured_remote_hosts(&self) -> Vec<String> {
+        self.config
+            .hosts
+            .iter()
+            .filter(|host| host.ssh_target.is_some())
+            .map(|host| host.name.clone())
+            .collect()
+    }
+
+    fn has_missing_recent_dir_hosts(&self) -> bool {
+        if !self.recent_dirs.has_host_entries("local") {
+            return true;
+        }
+
+        self.configured_remote_hosts()
+            .into_iter()
+            .any(|host| !self.recent_dirs.has_host_entries(&host))
+    }
+
+    fn recent_dirs_response(&self, limit: usize, is_complete: bool) -> DaemonMessage {
+        let entries = self.recent_dirs.entries(limit);
+        DaemonMessage::RecentDirs {
+            entries,
+            is_complete,
+        }
+    }
+
+    async fn hydrate_missing_recent_dirs(&mut self, limit: usize) -> bool {
+        let mut updated = false;
+
+        if !self.recent_dirs.has_host_entries("local") {
+            let entries = local::recent_directories(limit).await;
+            if !entries.is_empty() {
+                self.recent_dirs.upsert_many(entries);
+                updated = true;
+            }
+        }
+
+        for host_name in self.configured_remote_hosts() {
+            if self.recent_dirs.has_host_entries(&host_name) {
+                continue;
+            }
+
+            if !self.ssh_manager.is_connected(&host_name).await {
+                let Some(host_config) = self.config.hosts.iter().find(|host| host.name == host_name) else {
+                    continue;
+                };
+
+                if let Err(error) = self.ssh_manager.connect(host_config).await {
+                    tracing::warn!("SSH connect to {} failed during recent-dir hydration: {}", host_name, error);
+                    continue;
+                }
+            }
+
+            let entries = remote::recent_directories(&self.ssh_manager, &host_name, limit).await;
+            if !entries.is_empty() {
+                self.recent_dirs.upsert_many(entries);
+                updated = true;
+            }
+        }
+
+        if updated {
+            self.persist_recent_dirs();
+        }
+
+        updated
+    }
+
+    async fn create_session(
+        &mut self,
+        host: &str,
+        directory: &str,
+        name_hint: Option<String>,
+    ) -> Result<AttachSpec> {
+        let now_ms = current_unix_ms();
+        let name = self.next_session_name(host, directory, name_hint).await?;
+
+        if host == "local" {
+            let status = Command::new("tmux")
+                .args(["new-session", "-d", "-s", &name, "-c", directory, "opencode"])
+                .status()
+                .await
+                .with_context(|| format!("Failed to start tmux session '{}': {}", name, directory))?;
+
+            if !status.success() {
+                anyhow::bail!("tmux new-session failed for '{}': {}", name, directory);
+            }
+        } else {
+            self.ensure_remote_connection(host).await?;
+            let command = format!(
+                "tmux new-session -d -s '{}' -c '{}' opencode",
+                shell_escape(&name),
+                shell_escape(directory)
+            );
+            self.ssh_manager
+                .exec(host, &command)
+                .await
+                .with_context(|| format!("Failed to create remote session '{}' on {}", name, host))?;
+        }
+
+        self.record_recent_dir(host, directory, now_ms);
+        self.persist_recent_dirs();
+        self.attach_spec_for_new_session(host, &name).await
+    }
+
+    async fn drop_in_attach_spec(&mut self, session_id: &str) -> Result<AttachSpec> {
+        let Some(session) = self
+            .sessions
+            .values()
+            .find(|session| session.id == session_id)
+            .cloned()
+        else {
+            anyhow::bail!("Session not found: {}", session_id);
+        };
+
+        if session.host == "local" {
+            let window = session.tmux_window.clone();
+            let pane = session.tmux_pane.clone();
+            let session_name = session
+                .tmux_session
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("No tmux info — cannot drop in"))?;
+            Ok(AttachSpec::LocalTmux {
+                session: session_name,
+                window,
+                pane,
+            })
+        } else if let Some(tmux_session) = session.tmux_session.clone() {
+            let target = if let (Some(window), Some(pane)) = (session.tmux_window.clone(), session.tmux_pane.clone()) {
+                format!("{}:{}.{}", tmux_session, window, pane)
+            } else {
+                tmux_session.clone()
+            };
+            self.attach_spec_for_remote_tmux(&session.host, &target)
+                .await
+        } else {
+            self.attach_spec_for_remote_shell(&session.host).await
+        }
+    }
+
+    async fn attach_spec_for_new_session(&mut self, host: &str, session: &str) -> Result<AttachSpec> {
+        if host == "local" {
+            return Ok(AttachSpec::LocalTmux {
+                session: session.to_string(),
+                window: None,
+                pane: None,
+            });
+        }
+
+        self.attach_spec_for_remote_tmux(host, session).await
+    }
+
+    async fn attach_spec_for_remote_tmux(&mut self, host: &str, target: &str) -> Result<AttachSpec> {
+        self.ensure_remote_connection(host).await?;
+        let remote_command = format!("tmux attach -t '{}'", shell_escape(target));
+        let (program, args) = self
+            .ssh_manager
+            .build_command_args(host, true, Some(&remote_command))?;
+        Ok(AttachSpec::Exec {
+            program,
+            args,
+            tmux_window_name: Some(format!("{}:{}", host, display_name(target))),
+        })
+    }
+
+    async fn attach_spec_for_remote_shell(&mut self, host: &str) -> Result<AttachSpec> {
+        self.ensure_remote_connection(host).await?;
+        let (program, args) = self.ssh_manager.build_command_args(host, true, None)?;
+        Ok(AttachSpec::Exec {
+            program,
+            args,
+            tmux_window_name: Some(host.to_string()),
+        })
+    }
+
+    async fn ensure_remote_connection(&mut self, host: &str) -> Result<()> {
+        if self.ssh_manager.is_connected(host).await {
+            return Ok(());
+        }
+
+        let host_config = self
+            .config
+            .hosts
+            .iter()
+            .find(|cfg| cfg.name == host)
+            .ok_or_else(|| anyhow::anyhow!("Host '{}' not found in config", host))?;
+
+        self.ssh_manager.connect(host_config).await
+    }
+
+    async fn next_session_name(
+        &mut self,
+        host: &str,
+        directory: &str,
+        name_hint: Option<String>,
+    ) -> Result<String> {
+        let base_name = sanitize_session_name(
+            name_hint
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| directory_basename(directory)),
+        );
+
+        let mut candidate = base_name.clone();
+        let mut suffix = 2;
+        while self.session_name_exists(host, &candidate).await? {
+            candidate = format!("{}-{}", base_name, suffix);
+            suffix += 1;
+        }
+        Ok(candidate)
+    }
+
+    async fn session_name_exists(&mut self, host: &str, name: &str) -> Result<bool> {
+        if host == "local" {
+            let status = Command::new("tmux")
+                .args(["has-session", "-t", name])
+                .status()
+                .await
+                .with_context(|| format!("Failed to check local tmux session '{}'", name))?;
+            return Ok(status.success());
+        }
+
+        self.ensure_remote_connection(host).await?;
+        let command = format!(
+            "tmux has-session -t '{}' >/dev/null 2>&1 && printf yes || true",
+            shell_escape(name)
+        );
+        let output = self.ssh_manager.exec(host, &command).await?;
+        Ok(output.trim() == "yes")
     }
 
     /// Handle a single client connection (simplified: synchronous read-then-close).
@@ -437,6 +697,44 @@ impl DaemonCore {
             ClientMessage::RefreshAll => {
                 self.scan_all_hosts().await;
                 self.broadcast_snapshot();
+                let snapshot = DaemonMessage::StateSnapshot {
+                    sessions: self.sessions.values().cloned().collect(),
+                    hosts: self.hosts.values().cloned().collect(),
+                };
+                let _ = ipc::send_message(&mut write_half, &snapshot).await;
+            }
+            ClientMessage::GetRecentDirs { limit } => {
+                let missing_hosts = self.has_missing_recent_dir_hosts();
+                let initial = self.recent_dirs_response(limit as usize, !missing_hosts);
+                let _ = ipc::send_message(&mut write_half, &initial).await;
+
+                if missing_hosts {
+                    let _ = self.hydrate_missing_recent_dirs(limit as usize).await;
+                    let final_update = self.recent_dirs_response(limit as usize, true);
+                    let _ = ipc::send_message(&mut write_half, &final_update).await;
+                }
+            }
+            ClientMessage::CreateSession {
+                host,
+                directory,
+                name_hint,
+            } => {
+                let response = match self.create_session(&host, &directory, name_hint).await {
+                    Ok(attach) => DaemonMessage::AttachReady { attach },
+                    Err(error) => DaemonMessage::Error {
+                        message: error.to_string(),
+                    },
+                };
+                let _ = ipc::send_message(&mut write_half, &response).await;
+            }
+            ClientMessage::DropIn { session_id } => {
+                let response = match self.drop_in_attach_spec(&session_id).await {
+                    Ok(attach) => DaemonMessage::AttachReady { attach },
+                    Err(error) => DaemonMessage::Error {
+                        message: error.to_string(),
+                    },
+                };
+                let _ = ipc::send_message(&mut write_half, &response).await;
             }
             ClientMessage::Shutdown => {
                 tracing::info!("Shutdown requested via IPC");
@@ -451,7 +749,46 @@ impl DaemonCore {
                 use nix::unistd::Pid;
                 let _ = kill(Pid::from_raw(std::process::id() as i32), Signal::SIGTERM);
             }
-            _ => {}
         }
     }
+}
+
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn directory_basename(directory: &str) -> &str {
+    directory
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("opencode")
+}
+
+fn sanitize_session_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '-',
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+
+    if sanitized.is_empty() {
+        "opencode".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn shell_escape(value: &str) -> String {
+    value.replace('\'', "'\\''")
+}
+
+fn display_name(target: &str) -> String {
+    target.split(':').next().unwrap_or(target).to_string()
 }

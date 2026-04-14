@@ -21,7 +21,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         "B:{} I:{} W:{} E:{}",
         counts.0, counts.1, counts.2, counts.3
     );
-    let right = "[?] help  [a] approve  [⏎] drop-in  [q] quit";
+    let right = "[?] help  [n] new  [a] approve  [⏎] drop-in  [q] quit";
     let center = app.current_status_msg().unwrap_or("").to_string();
 
     let chunks = Layout::default()
