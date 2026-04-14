@@ -33,7 +33,6 @@ pub struct DaemonCore {
     hosts: HashMap<String, HostStatus>,
     pending_scan_targets: VecDeque<ScanTarget>,
     rescan_requested: bool,
-    refresh_waiters: Vec<tokio::sync::oneshot::Sender<DaemonMessage>>,
     broadcast_tx: BroadcastTx,
     started_at: Instant,
     bell_notifier: BellNotifier,
@@ -54,7 +53,6 @@ impl DaemonCore {
             hosts: HashMap::new(),
             pending_scan_targets: VecDeque::new(),
             rescan_requested: false,
-            refresh_waiters: Vec::new(),
             broadcast_tx,
             started_at: Instant::now(),
             bell_notifier: BellNotifier::new(),
@@ -122,8 +120,6 @@ impl DaemonCore {
                     }
 
                     if self.pending_scan_targets.is_empty() {
-                        self.notify_refresh_waiters();
-
                         if self.rescan_requested {
                             self.rescan_requested = false;
                             self.enqueue_scan_cycle();
@@ -163,14 +159,23 @@ impl DaemonCore {
         }
     }
 
-    fn notify_refresh_waiters(&mut self) {
-        if self.refresh_waiters.is_empty() {
-            return;
-        }
+    async fn scan_all_hosts(&mut self) {
+        self.ensure_host_placeholders();
 
-        let snapshot = self.state_snapshot();
-        for waiter in self.refresh_waiters.drain(..) {
-            let _ = waiter.send(snapshot.clone());
+        let mut pending_scan_targets = VecDeque::new();
+        pending_scan_targets.push_back(ScanTarget::Local);
+        pending_scan_targets.extend(
+            self.config
+                .hosts
+                .iter()
+                .filter(|host| host.ssh_target.is_some())
+                .cloned()
+                .map(ScanTarget::Remote),
+        );
+
+        while let Some(target) = pending_scan_targets.pop_front() {
+            self.scan_target(target).await;
+            self.broadcast_snapshot();
         }
     }
 
@@ -782,18 +787,8 @@ impl DaemonCore {
                 }
             }
             ClientMessage::RefreshAll => {
-                self.pending_scan_targets.clear();
-                self.rescan_requested = false;
-                self.request_scan_cycle();
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                self.refresh_waiters.push(tx);
-
-                tokio::spawn(async move {
-                    let Ok(snapshot) = rx.await else {
-                        return;
-                    };
-                    let _ = ipc::send_message(&mut write_half, &snapshot).await;
-                });
+                self.scan_all_hosts().await;
+                let _ = ipc::send_message(&mut write_half, &self.state_snapshot()).await;
             }
             ClientMessage::GetRecentDirs { limit } => {
                 let missing_hosts = self.has_missing_recent_dir_hosts();
