@@ -43,6 +43,7 @@ struct RecentDirsModal {
 pub struct App {
     pub sessions: Vec<SessionInfo>,
     pub hosts: Vec<HostStatus>,
+    pub expanded_session_keys: HashSet<String>,
     pub selected_index: usize,
     pub should_quit: bool,
     pub daemon_connected: bool,
@@ -59,6 +60,7 @@ impl App {
         Self {
             sessions: Vec::new(),
             hosts: Vec::new(),
+            expanded_session_keys: HashSet::new(),
             selected_index: 0,
             should_quit: false,
             daemon_connected: false,
@@ -103,7 +105,10 @@ impl App {
     }
 
     pub fn move_down(&mut self) {
-        let ordered = crate::tui::session_list::ordered_session_indices(&self.sessions);
+        let ordered = crate::tui::session_list::ordered_session_indices(
+            &self.sessions,
+            &self.expanded_session_keys,
+        );
         if ordered.is_empty() {
             return;
         }
@@ -118,7 +123,10 @@ impl App {
     }
 
     pub fn move_up(&mut self) {
-        let ordered = crate::tui::session_list::ordered_session_indices(&self.sessions);
+        let ordered = crate::tui::session_list::ordered_session_indices(
+            &self.sessions,
+            &self.expanded_session_keys,
+        );
         if ordered.is_empty() {
             return;
         }
@@ -130,6 +138,73 @@ impl App {
         let prev_pos = current_pos.saturating_sub(1);
         self.selected_index = ordered[prev_pos];
         self.clear_attention_for_selected();
+    }
+
+    pub fn expand_selected(&mut self) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        if crate::tui::session_list::session_has_children(&self.sessions, self.selected_index) {
+            self.expanded_session_keys.insert(session.key());
+        }
+        self.ensure_selected_visible();
+    }
+
+    pub fn collapse_selected(&mut self) {
+        let selected_key = self.selected_session().map(SessionInfo::key);
+        let selected_has_children =
+            crate::tui::session_list::session_has_children(&self.sessions, self.selected_index);
+
+        if let Some(selected_key) = selected_key {
+            if selected_has_children && self.expanded_session_keys.remove(&selected_key) {
+                self.ensure_selected_visible();
+                self.clear_attention_for_selected();
+                return;
+            }
+        }
+
+        if let Some(parent_index) =
+            crate::tui::session_list::parent_session_index(&self.sessions, self.selected_index)
+        {
+            let parent_key = self.sessions[parent_index].key();
+            self.expanded_session_keys.remove(&parent_key);
+            self.selected_index = parent_index;
+            self.ensure_selected_visible();
+            self.clear_attention_for_selected();
+        }
+    }
+
+    fn ensure_selected_visible(&mut self) {
+        if self.sessions.is_empty() {
+            self.selected_index = 0;
+            return;
+        }
+
+        let ordered = crate::tui::session_list::ordered_session_indices(
+            &self.sessions,
+            &self.expanded_session_keys,
+        );
+        let Some(&first_visible) = ordered.first() else {
+            self.selected_index = 0;
+            return;
+        };
+
+        if ordered.contains(&self.selected_index) {
+            return;
+        }
+
+        let mut current_index = self.selected_index;
+        while let Some(parent_index) =
+            crate::tui::session_list::parent_session_index(&self.sessions, current_index)
+        {
+            if ordered.contains(&parent_index) {
+                self.selected_index = parent_index;
+                return;
+            }
+            current_index = parent_index;
+        }
+
+        self.selected_index = first_visible;
     }
 
     fn request_daemon(&self, msg: ClientMessage) {
@@ -357,6 +432,8 @@ async fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::Right | KeyCode::Char('l') => app.expand_selected(),
+        KeyCode::Left | KeyCode::Char('h') => app.collapse_selected(),
         KeyCode::Char('r') => {
             app.request_daemon(ClientMessage::RefreshAll);
             app.set_status("Refreshing...", Duration::from_secs(2));
@@ -393,7 +470,7 @@ async fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
         }
         KeyCode::Char('?') => {
             app.set_status(
-                "j/k: navigate  n: new  a: approve  enter: drop-in  r: refresh  q: quit",
+                "j/k: navigate  ←/→: collapse/expand  n: new  a: approve  enter: drop-in  r: refresh  q: quit",
                 Duration::from_secs(5),
             );
         }
@@ -440,6 +517,8 @@ fn handle_daemon_message(app: &mut App, msg: DaemonMessage) {
             } else {
                 app.sessions.push(session);
             }
+            retain_expandable_session_keys(app);
+            app.ensure_selected_visible();
         }
         DaemonMessage::Bell {
             session_id,
@@ -496,6 +575,7 @@ fn replace_sessions(app: &mut App, sessions: Vec<SessionInfo>, hosts: Vec<HostSt
 
     app.sessions = sessions;
     app.hosts = hosts;
+    retain_expandable_session_keys(app);
 
     if let Some(selected_session_key) = selected_session_key {
         if let Some(selected_index) = app
@@ -504,6 +584,7 @@ fn replace_sessions(app: &mut App, sessions: Vec<SessionInfo>, hosts: Vec<HostSt
             .position(|session| session.key() == selected_session_key)
         {
             app.selected_index = selected_index;
+            app.ensure_selected_visible();
             return;
         }
     }
@@ -516,7 +597,20 @@ fn clamp_index(app: &mut App) {
         app.selected_index = 0;
     } else {
         app.selected_index = app.selected_index.min(app.sessions.len() - 1);
+        app.ensure_selected_visible();
     }
+}
+
+fn retain_expandable_session_keys(app: &mut App) {
+    let expandable_keys = app
+        .sessions
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| crate::tui::session_list::session_has_children(&app.sessions, *index))
+        .map(|(_, session)| session.key())
+        .collect::<HashSet<_>>();
+    app.expanded_session_keys
+        .retain(|key| expandable_keys.contains(key));
 }
 
 fn render(frame: &mut Frame, app: &App) {

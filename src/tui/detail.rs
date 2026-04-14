@@ -49,11 +49,10 @@ pub fn desired_height(app: &App, area_width: u16) -> u16 {
 
 fn build_detail_lines(s: &SessionInfo) -> Vec<Line<'static>> {
     let state_color = match &s.state {
-        SessionState::Idle => Color::Green,
-        SessionState::Busy => Color::Yellow,
-        SessionState::WaitingForPermission
-        | SessionState::WaitingForInput
-        | SessionState::Error => Color::Red,
+        SessionState::Idle => Color::DarkGray,
+        SessionState::Busy => Color::Green,
+        SessionState::WaitingForPermission | SessionState::WaitingForInput => Color::Yellow,
+        SessionState::Error => Color::Red,
         _ => Color::DarkGray,
     };
 
@@ -75,6 +74,10 @@ fn build_detail_lines(s: &SessionInfo) -> Vec<Line<'static>> {
         row(label, value, "Dir", &s.working_dir),
         row(label, value, "Updated", &s.activity_age_human()),
     ];
+
+    if let Some(parent_id) = &s.parent_id {
+        lines.push(row(label, value, "Parent", parent_id));
+    }
 
     if s.tmux_session.is_some() || s.tmux_window.is_some() || s.tmux_pane.is_some() {
         lines.push(Line::raw(""));
@@ -113,6 +116,10 @@ fn build_detail_plain_lines(s: &SessionInfo) -> Vec<String> {
         row_text("Dir", &s.working_dir),
         row_text("Updated", &s.activity_age_human()),
     ];
+
+    if let Some(parent_id) = &s.parent_id {
+        lines.push(row_text("Parent", parent_id));
+    }
 
     if s.tmux_session.is_some() || s.tmux_window.is_some() || s.tmux_pane.is_some() {
         lines.push(String::new());
