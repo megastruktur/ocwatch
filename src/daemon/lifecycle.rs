@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::net::UnixListener;
 
 /// Returns the path to the daemon's Unix socket.
 pub fn socket_path() -> PathBuf {
@@ -159,30 +158,40 @@ pub async fn stop_daemon() -> Result<()> {
 
 /// Print daemon status as JSON.
 pub async fn daemon_status() -> Result<()> {
-    let socket_file = socket_path();
-    let pid_file = pid_path();
+    use crate::ipc::{connect_to_daemon, send_message, read_message, ClientMessage, DaemonMessage};
+    use tokio::io::BufReader;
 
+    let socket_file = socket_path();
     if !socket_file.exists() {
         println!(r#"{{"running": false, "reason": "socket not found"}}"#);
         std::process::exit(1);
     }
 
-    if pid_file.exists() {
-        let pid_str = std::fs::read_to_string(&pid_file).unwrap_or_default();
-        let pid: u32 = pid_str.trim().parse().unwrap_or(0);
-        if is_pid_alive(pid) {
-            // TODO: connect to socket and get full status (Task 5 IPC)
-            println!(
-                r#"{{"running": true, "pid": {}, "socket": "{}"}}"#,
-                pid,
-                socket_file.display()
-            );
-            return Ok(());
+    let stream = match connect_to_daemon().await {
+        Ok(s) => s,
+        Err(e) => {
+            println!(r#"{{"running": false, "reason": "{}"}}"#, e);
+            std::process::exit(1);
+        }
+    };
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    send_message(&mut write_half, &ClientMessage::GetStatus).await
+        .context("Failed to send GetStatus")?;
+
+    match read_message::<DaemonMessage>(&mut reader).await? {
+        Some(msg) => {
+            println!("{}", serde_json::to_string_pretty(&msg)?);
+        }
+        None => {
+            println!(r#"{{"running": false, "reason": "no response from daemon"}}"#);
+            std::process::exit(1);
         }
     }
 
-    println!(r#"{{"running": false}}"#);
-    std::process::exit(1);
+    Ok(())
 }
 
 /// Run the daemon in foreground (called by 'daemon start' as a child process).
@@ -202,52 +211,20 @@ pub async fn run_daemon() -> Result<()> {
     let socket_file = socket_path();
     let _ = std::fs::remove_file(&socket_file);
 
-    let listener = UnixListener::bind(&socket_file)
-        .with_context(|| format!("Failed to bind Unix socket: {:?}", socket_file))?;
-
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&socket_file, std::fs::Permissions::from_mode(0o600))
-        .context("Failed to set socket permissions")?;
-
-    tracing::info!("Unix socket created: {:?}", socket_file);
-
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("Failed to register SIGTERM handler")?;
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("Failed to register SIGINT handler")?;
-
-    tracing::info!("Daemon ready. Waiting for connections and signals.");
-
-    // TODO: Task 10 replaces this with the full event loop
-    loop {
-        tokio::select! {
-            _ = sigterm.recv() => {
-                tracing::info!("Received SIGTERM, shutting down");
-                break;
-            }
-            _ = sigint.recv() => {
-                tracing::info!("Received SIGINT, shutting down");
-                break;
-            }
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, _)) => {
-                        tracing::debug!("Client connected");
-                        // TODO: handle client in Task 10
-                        drop(stream);
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to accept connection: {}", e);
-                    }
-                }
-            }
+    let config = match crate::config::Config::load() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::warn!("Failed to load config, using defaults: {}", err);
+            crate::config::Config::default()
         }
-    }
+    };
+    let core = crate::daemon::core::DaemonCore::new(config);
 
-    tracing::info!("Cleaning up...");
+    let result = core.run().await;
+
     let _ = std::fs::remove_file(&socket_file);
     let _ = std::fs::remove_file(&pid_file);
     tracing::info!("Daemon stopped.");
 
-    Ok(())
+    result
 }

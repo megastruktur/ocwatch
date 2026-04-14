@@ -4,8 +4,8 @@ use tokio::process::Command;
 
 /// Returns empty Vec (not error) if tmux is not running or no opencode panes found.
 pub async fn scan_local_tmux() -> Vec<DiscoveredInstance> {
-    match try_scan_local_tmux().await {
-        Ok(instances) => instances,
+    let instances = match try_scan_local_tmux().await {
+        Ok(i) => i,
         Err(e) => {
             tracing::debug!(
                 "Local tmux scan failed (expected if tmux not running): {}",
@@ -13,7 +13,13 @@ pub async fn scan_local_tmux() -> Vec<DiscoveredInstance> {
             );
             vec![]
         }
+    };
+
+    if instances.is_empty() {
+        return scan_all_processes().await;
     }
+
+    instances
 }
 
 async fn try_scan_local_tmux() -> Result<Vec<DiscoveredInstance>> {
@@ -80,6 +86,56 @@ async fn try_scan_local_tmux() -> Result<Vec<DiscoveredInstance>> {
     }
 
     Ok(instances)
+}
+
+async fn scan_all_processes() -> Vec<DiscoveredInstance> {
+    let output = match Command::new("ps")
+        .args(["aux"])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(_) => return vec![],
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut instances = Vec::new();
+
+    for line in stdout.lines() {
+        let lower = line.to_lowercase();
+        if !lower.contains("opencode") && !lower.contains(".opencode/") {
+            continue;
+        }
+        if line.contains("grep") || line.contains("ps aux") || line.contains("ocwatch") {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let pid: u32 = match parts[1].parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        if let Some(port) = discover_port_for_pid(pid).await {
+            instances.push(DiscoveredInstance {
+                pid,
+                port,
+                remote_port: None,
+                tmux_session: None,
+                tmux_window: None,
+                tmux_window_index: None,
+                tmux_pane_index: None,
+                tmux_pane_tty: None,
+            });
+        }
+    }
+
+    instances.sort_by_key(|i| i.port);
+    instances.dedup_by_key(|i| i.port);
+    instances
 }
 
 fn is_opencode_command(cmd: &str) -> bool {
@@ -168,7 +224,7 @@ fn is_opencode_pid(ps_output: &str, pid: u32) -> bool {
 
 async fn discover_port_for_pid(pid: u32) -> Option<u16> {
     if let Ok(output) = Command::new("lsof")
-        .args(["-p", &pid.to_string(), "-i", "-P", "-n"])
+        .args(["-a", "-p", &pid.to_string(), "-i", "-P", "-n"])
         .output()
         .await
     {
