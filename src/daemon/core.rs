@@ -4,6 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
 
 use crate::config::Config;
+use crate::daemon::bell::BellNotifier;
 use crate::discovery::{local, remote, DiscoveredInstance};
 use crate::ipc::{self, BroadcastTx, ClientMessage, DaemonMessage};
 use crate::opencode::client::OcClient;
@@ -13,7 +14,6 @@ use crate::types::{HostStatus, SessionInfo, SessionState};
 /// Internal runtime state for a session (NOT serialized).
 struct SessionRuntime {
     last_state: SessionState,
-    last_bell_at: Option<Instant>,
     oc_base_url: String,
 }
 
@@ -25,6 +25,7 @@ pub struct DaemonCore {
     hosts: HashMap<String, HostStatus>,
     broadcast_tx: BroadcastTx,
     started_at: Instant,
+    bell_notifier: BellNotifier,
 }
 
 impl DaemonCore {
@@ -38,6 +39,7 @@ impl DaemonCore {
             hosts: HashMap::new(),
             broadcast_tx,
             started_at: Instant::now(),
+            bell_notifier: BellNotifier::new(),
         }
     }
 
@@ -227,21 +229,27 @@ impl DaemonCore {
                     .map(|r| r.last_state.clone());
 
                 if let Some(prev) = prev_state {
-                    if prev != state && self.should_bell(&state, &key) {
-                        self.fire_bell(&info, &state);
+                    let reason = match &state {
+                        SessionState::Idle => "idle",
+                        SessionState::WaitingForPermission => "permission",
+                        SessionState::WaitingForInput => "input",
+                        SessionState::Error => "error",
+                        _ => "attention",
+                    };
+                    if self.bell_notifier.should_bell(&key, &prev, &state) {
+                        self.bell_notifier.fire_bell(&info, reason);
+                        let _ = self.broadcast_tx.send(DaemonMessage::Bell {
+                            session_id: info.id.clone(),
+                            host: info.host.clone(),
+                            reason: reason.to_string(),
+                        });
                     }
                 }
-
-                let last_bell_at = self
-                    .session_runtime
-                    .get(&key)
-                    .and_then(|r| r.last_bell_at);
 
                 self.session_runtime.insert(
                     key.clone(),
                     SessionRuntime {
                         last_state: state.clone(),
-                        last_bell_at,
                         oc_base_url: base_url.clone(),
                     },
                 );
@@ -284,52 +292,7 @@ impl DaemonCore {
             .retain(|key, _| !key.starts_with(&prefix) || seen_keys.contains(key));
     }
 
-    /// Should we ring a bell for this state transition?
-    fn should_bell(&mut self, new_state: &SessionState, key: &str) -> bool {
-        if !new_state.should_bell() {
-            return false;
-        }
-        const BELL_COOLDOWN: Duration = Duration::from_secs(30);
-        let runtime = self.session_runtime.get_mut(key);
-        if let Some(rt) = runtime {
-            if let Some(last) = rt.last_bell_at {
-                if last.elapsed() < BELL_COOLDOWN {
-                    return false;
-                }
-            }
-            rt.last_bell_at = Some(Instant::now());
-        }
-        true
-    }
 
-    /// Fire a tmux bell for a session.
-    fn fire_bell(&self, session: &SessionInfo, state: &SessionState) {
-        let reason = match state {
-            SessionState::Idle => "idle",
-            SessionState::WaitingForPermission => "permission",
-            SessionState::WaitingForInput => "input",
-            SessionState::Error => "error",
-            _ => "attention",
-        };
-
-        tracing::info!("bell fired for session {} ({})", session.id, reason);
-
-        let _ = self.broadcast_tx.send(DaemonMessage::Bell {
-            session_id: session.id.clone(),
-            host: session.host.clone(),
-            reason: reason.to_string(),
-        });
-
-        if let (Some(tmux_session), Some(tmux_window)) =
-            (session.tmux_session.as_deref(), session.tmux_window.as_deref())
-        {
-            let target = format!("{}:{}", tmux_session, tmux_window);
-            let message = format!("ocwatch: {} needs attention", session.title);
-            let _ = std::process::Command::new("tmux")
-                .args(["display-message", "-t", &target, &message])
-                .spawn();
-        }
-    }
 
     /// Broadcast a full state snapshot to all connected clients.
     fn broadcast_snapshot(&self) {
@@ -412,9 +375,21 @@ impl DaemonCore {
                         let old_state = info.state.clone();
                         info.state = new_state.clone();
 
-                        if old_state != new_state && self.should_bell(&new_state, &key) {
+                        let reason = match &new_state {
+                            SessionState::Idle => "idle",
+                            SessionState::WaitingForPermission => "permission",
+                            SessionState::WaitingForInput => "input",
+                            SessionState::Error => "error",
+                            _ => "attention",
+                        };
+                        if self.bell_notifier.should_bell(&key, &old_state, &new_state) {
                             if let Some(session) = self.sessions.get(&key) {
-                                self.fire_bell(session, &new_state);
+                                self.bell_notifier.fire_bell(session, reason);
+                                let _ = self.broadcast_tx.send(DaemonMessage::Bell {
+                                    session_id: session.id.clone(),
+                                    host: session.host.clone(),
+                                    reason: reason.to_string(),
+                                });
                             }
                         }
 

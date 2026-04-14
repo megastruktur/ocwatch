@@ -122,7 +122,40 @@ async fn run_tui() -> Result<()> {
 }
 
 async fn run_approve(session_id: &str) -> Result<()> {
-    eprintln!("Approve not yet implemented — Task 14");
+    use anyhow::Context;
+    use tokio::io::BufReader;
+
+    let stream = ipc::connect_to_daemon()
+        .await
+        .context("Failed to connect to daemon")?;
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    ipc::send_message(
+        &mut write_half,
+        &ipc::ClientMessage::Approve {
+            session_id: session_id.to_string(),
+        },
+    )
+    .await
+    .context("Failed to send approve message")?;
+
+    match ipc::read_message::<ipc::DaemonMessage>(&mut reader).await {
+        Ok(Some(ipc::DaemonMessage::SessionUpdated { session })) => {
+            println!("Approved: {} → {}", session.id, session.state);
+        }
+        Ok(Some(ipc::DaemonMessage::Error { message })) => {
+            anyhow::bail!("Daemon error: {}", message);
+        }
+        Ok(Some(other)) => {
+            println!("{}", serde_json::to_string(&other)?);
+        }
+        Ok(None) | Err(_) => {
+            println!("Approved session {}", session_id);
+        }
+    }
+
     Ok(())
 }
 
@@ -165,6 +198,27 @@ async fn debug_ipc_roundtrip() -> Result<()> {
 }
 
 async fn debug_inject_event(session_id: &str, state: &str) -> Result<()> {
-    eprintln!("inject-event not yet implemented — Task 10");
+    use anyhow::Context;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use crate::ipc::{connect_to_daemon, ClientMessage};
+
+    let stream = connect_to_daemon().await
+        .context("Failed to connect to daemon")?;
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    let msg = serde_json::to_string(&ClientMessage::InjectEvent {
+        session_id: session_id.to_string(),
+        state: state.to_string(),
+    })? + "\n";
+    write_half.write_all(msg.as_bytes()).await?;
+    write_half.flush().await?;
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    if !line.trim().is_empty() {
+        println!("{}", line.trim());
+    }
     Ok(())
 }

@@ -11,7 +11,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
-    widgets::{Block, Paragraph},
+    widgets::Paragraph,
     Frame, Terminal,
 };
 use std::io;
@@ -21,7 +21,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::ipc::{connect_to_daemon, read_message, send_message, ClientMessage, DaemonMessage};
-use crate::types::{HostStatus, SessionInfo, SessionState};
+use crate::types::{HostStatus, SessionInfo};
 
 /// Transient status message shown in status bar.
 struct StatusMsg {
@@ -236,18 +236,33 @@ async fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
         }
         KeyCode::Char('a') => {
             if let Some(session) = app.selected_session() {
-                let session_id = session.id.clone();
-                app.send_to_daemon(ClientMessage::Approve { session_id }).await;
-                app.set_status("Approving...", Duration::from_secs(3));
+                let session = session.clone();
+                if let Some(tx) = &app.daemon_tx {
+                    let tx = tx.clone();
+                    let msg = crate::tui::interaction::handle_approve(&session, &tx).await;
+                    app.set_status(msg, Duration::from_secs(5));
+                }
             } else {
                 app.set_status("No session selected", Duration::from_secs(2));
             }
         }
         KeyCode::Enter => {
             if let Some(session) = app.selected_session() {
-                let session_id = session.id.clone();
-                // Drop-in: actual logic in interaction.rs (Task 14)
-                app.send_to_daemon(ClientMessage::DropIn { session_id }).await;
+                let action = crate::tui::interaction::handle_drop_in(session);
+                match action {
+                    crate::tui::interaction::DropInAction::NoTmux => {
+                        app.set_status(
+                            "No tmux info — cannot drop in",
+                            Duration::from_secs(3),
+                        );
+                    }
+                    other => {
+                        app.should_quit = true;
+                        if let Some(msg) = other.execute() {
+                            eprintln!("{}", msg);
+                        }
+                    }
+                }
             }
         }
         KeyCode::Char('?') => {
@@ -339,97 +354,13 @@ fn render(f: &mut Frame, app: &App) {
 }
 
 fn render_session_list(f: &mut Frame, app: &App, area: Rect) {
-    let content = if !app.daemon_connected {
-        "Daemon disconnected".to_string()
-    } else if app.sessions.is_empty() {
-        "No sessions found\n\nStart OpenCode with:\n  opencode --port 0".to_string()
-    } else {
-        app.sessions
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let prefix = if i == app.selected_index { "▶ " } else { "  " };
-                let title: String = s.title.chars().take(40).collect();
-                format!("{prefix}{} {title} [{}]", s.state.icon(), s.host)
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let block = Block::bordered().title(" Sessions ");
-    let paragraph = Paragraph::new(content).block(block);
-    f.render_widget(paragraph, area);
+    crate::tui::session_list::render(f, app, area);
 }
 
 fn render_detail(f: &mut Frame, app: &App, area: Rect) {
-    let content = match app.selected_session() {
-        None => "Select a session".to_string(),
-        Some(s) => {
-            let title: String = s.title.chars().take(50).collect();
-            let dir: String = s.working_dir.chars().take(40).collect();
-            format!(
-                "Title:   {title}\nState:   {} {}\nHost:    {}\nModel:   {}\nDir:     {dir}\nUptime:  {}",
-                s.state.icon(),
-                s.state,
-                s.host,
-                s.model.as_deref().unwrap_or("—"),
-                s.uptime_human(),
-            )
-        }
-    };
-
-    let block = Block::bordered().title(" Detail ");
-    let paragraph = Paragraph::new(content).block(block);
-    f.render_widget(paragraph, area);
+    crate::tui::detail::render(f, app, area);
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    let text = if !app.daemon_connected {
-        "⚠ Daemon disconnected — start with: ocwatch daemon start".to_string()
-    } else {
-        let counts = count_by_state(&app.sessions);
-        let left = format!(
-            "B:{} I:{} W:{} E:{}",
-            counts.busy, counts.idle, counts.waiting, counts.error
-        );
-        let right = "[?] help  [a] approve  [⏎] drop-in  [q] quit";
-        match app.current_status_msg() {
-            Some(center) => format!("{left}  {center}  {right}"),
-            None => format!("{left}  {right}"),
-        }
-    };
-
-    let paragraph = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(paragraph, area);
-}
-
-struct StateCounts {
-    busy: usize,
-    idle: usize,
-    waiting: usize,
-    error: usize,
-}
-
-fn count_by_state(sessions: &[SessionInfo]) -> StateCounts {
-    StateCounts {
-        busy: sessions
-            .iter()
-            .filter(|s| s.state == SessionState::Busy)
-            .count(),
-        idle: sessions
-            .iter()
-            .filter(|s| s.state == SessionState::Idle)
-            .count(),
-        waiting: sessions
-            .iter()
-            .filter(|s| {
-                s.state == SessionState::WaitingForPermission
-                    || s.state == SessionState::WaitingForInput
-            })
-            .count(),
-        error: sessions
-            .iter()
-            .filter(|s| s.state == SessionState::Error)
-            .count(),
-    }
+    crate::tui::status_bar::render(f, app, area);
 }
