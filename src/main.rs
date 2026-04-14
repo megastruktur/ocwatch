@@ -193,7 +193,27 @@ async fn debug_oc_client(url: &str) -> Result<()> {
 }
 
 async fn debug_ipc_roundtrip() -> Result<()> {
-    eprintln!("ipc-roundtrip not yet implemented — Task 5");
+    use anyhow::Context;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use crate::ipc::{connect_to_daemon, ClientMessage};
+
+    let stream = connect_to_daemon().await
+        .context("Failed to connect to daemon")?;
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    let msg = serde_json::to_string(&ClientMessage::GetStatus)? + "\n";
+    write_half.write_all(msg.as_bytes()).await?;
+    write_half.flush().await?;
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+
+    match serde_json::from_str::<serde_json::Value>(line.trim()) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+        Err(_) => println!("{}", line.trim()),
+    }
     Ok(())
 }
 

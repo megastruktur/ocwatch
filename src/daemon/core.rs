@@ -453,7 +453,9 @@ impl DaemonCore {
                     },
                 )
                 .await;
-                std::process::exit(0);
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+                let _ = kill(Pid::from_raw(std::process::id() as i32), Signal::SIGTERM);
             }
             _ => {}
         }
