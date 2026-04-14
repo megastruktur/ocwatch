@@ -31,6 +31,8 @@ pub struct DaemonCore {
     sessions: HashMap<String, SessionInfo>,
     session_runtime: HashMap<String, SessionRuntime>,
     hosts: HashMap<String, HostStatus>,
+    pending_scan_targets: VecDeque<ScanTarget>,
+    rescan_requested: bool,
     broadcast_tx: BroadcastTx,
     started_at: Instant,
     bell_notifier: BellNotifier,
@@ -49,6 +51,8 @@ impl DaemonCore {
             sessions: HashMap::new(),
             session_runtime: HashMap::new(),
             hosts: HashMap::new(),
+            pending_scan_targets: VecDeque::new(),
+            rescan_requested: false,
             broadcast_tx,
             started_at: Instant::now(),
             bell_notifier: BellNotifier::new(),
@@ -74,9 +78,8 @@ impl DaemonCore {
         let mut poll_interval = tokio::time::interval(Duration::from_secs(
             self.config.poll_interval_secs as u64,
         ));
-        let mut pending_scan_targets = VecDeque::new();
-        let mut rescan_requested = false;
-        self.enqueue_scan_cycle(&mut pending_scan_targets);
+        poll_interval.tick().await;
+        self.enqueue_scan_cycle();
 
         let mut sigterm = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
@@ -110,23 +113,19 @@ impl DaemonCore {
                         }
                     }
                 }
-                _ = std::future::ready(()), if !pending_scan_targets.is_empty() => {
-                    if let Some(target) = pending_scan_targets.pop_front() {
+                _ = std::future::ready(()), if !self.pending_scan_targets.is_empty() => {
+                    if let Some(target) = self.pending_scan_targets.pop_front() {
                         self.scan_target(target).await;
                         self.broadcast_snapshot();
                     }
 
-                    if pending_scan_targets.is_empty() && rescan_requested {
-                        rescan_requested = false;
-                        self.enqueue_scan_cycle(&mut pending_scan_targets);
+                    if self.pending_scan_targets.is_empty() && self.rescan_requested {
+                        self.rescan_requested = false;
+                        self.enqueue_scan_cycle();
                     }
                 }
                 _ = poll_interval.tick() => {
-                    if pending_scan_targets.is_empty() {
-                        self.enqueue_scan_cycle(&mut pending_scan_targets);
-                    } else {
-                        rescan_requested = true;
-                    }
+                    self.request_scan_cycle();
                 }
             }
         }
@@ -136,21 +135,9 @@ impl DaemonCore {
         Ok(())
     }
 
-    async fn scan_all_hosts(&mut self) {
-        self.ensure_host_placeholders();
-
-        let mut pending_scan_targets = VecDeque::new();
-        self.enqueue_scan_cycle(&mut pending_scan_targets);
-
-        while let Some(target) = pending_scan_targets.pop_front() {
-            self.scan_target(target).await;
-            self.broadcast_snapshot();
-        }
-    }
-
-    fn enqueue_scan_cycle(&self, pending_scan_targets: &mut VecDeque<ScanTarget>) {
-        pending_scan_targets.push_back(ScanTarget::Local);
-        pending_scan_targets.extend(
+    fn enqueue_scan_cycle(&mut self) {
+        self.pending_scan_targets.push_back(ScanTarget::Local);
+        self.pending_scan_targets.extend(
             self.config
                 .hosts
                 .iter()
@@ -158,6 +145,16 @@ impl DaemonCore {
                 .cloned()
                 .map(ScanTarget::Remote),
         );
+    }
+
+    fn request_scan_cycle(&mut self) {
+        self.ensure_host_placeholders();
+
+        if self.pending_scan_targets.is_empty() {
+            self.enqueue_scan_cycle();
+        } else {
+            self.rescan_requested = true;
+        }
     }
 
     fn ensure_host_placeholders(&mut self) {
@@ -766,8 +763,9 @@ impl DaemonCore {
                 }
             }
             ClientMessage::RefreshAll => {
-                self.scan_all_hosts().await;
-                self.broadcast_snapshot();
+                self.pending_scan_targets.clear();
+                self.rescan_requested = false;
+                self.request_scan_cycle();
                 let snapshot = DaemonMessage::StateSnapshot {
                     sessions: self.sessions.values().cloned().collect(),
                     hosts: self.hosts.values().cloned().collect(),
