@@ -140,13 +140,12 @@ async fn debug_scan_remote(host: &str) -> Result<()> {
 }
 
 async fn debug_ssh_check(host: &str) -> Result<()> {
-    eprintln!("ssh-check not yet implemented — Task 8");
-    Ok(())
+    let config = config::Config::load()?;
+    ssh::manager::debug_ssh_check(host, &config).await
 }
 
 async fn debug_oc_client(url: &str) -> Result<()> {
-    eprintln!("oc-client not yet implemented — Task 6");
-    Ok(())
+    opencode::client::debug_query(url).await
 }
 
 async fn debug_ipc_roundtrip() -> Result<()> {
