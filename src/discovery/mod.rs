@@ -1,7 +1,9 @@
+use serde::{Deserialize, Serialize};
+
 pub mod local;
 pub mod remote;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredInstance {
     pub pid: u32,
     pub port: u16,

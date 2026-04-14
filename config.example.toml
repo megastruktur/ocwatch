@@ -1,0 +1,16 @@
+# ocwatch configuration
+# Place this file at ~/.config/ocwatch/config.toml
+
+# How often to poll for session updates (seconds)
+poll_interval_secs = 5
+
+# Local machine is always monitored automatically.
+# Add remote hosts here:
+
+# Example remote host:
+# [[hosts]]
+# name = "megaserver"
+# ssh_target = "megaserver"
+# # ssh_identity = "/Users/you/.ssh/id_ed25519"
+# # ssh_port = 22
+# # tmux_session_filter = "dev"  # Only monitor sessions named "dev"
