@@ -1,6 +1,6 @@
 use crate::discovery::{
-    discover_port_from_lsof, infer_session_state_from_part, parse_tmux_output, ActiveSession,
-    DiscoveredInstance, ScanResult,
+    decode_sqlite_hex_payload, discover_port_from_lsof, infer_session_state_from_part,
+    parse_tmux_output, ActiveSession, DiscoveredInstance, ScanResult,
 };
 use crate::ipc::RecentDirEntry;
 use anyhow::Result;
@@ -61,25 +61,36 @@ async fn try_scan_local() -> Result<ScanResult> {
             None => continue,
         };
 
-        if let Some(session) = query_latest_session(&db_path, &project_id).await {
-            if !seen_session_ids.insert(session.id.clone()) {
-                continue;
+        if let Some(root_session) = query_latest_session(&db_path, &project_id).await {
+            let sessions = query_session_tree(&db_path, &root_session.id)
+                .await
+                .filter(|sessions| !sessions.is_empty())
+                .unwrap_or_else(|| vec![root_session.clone()]);
+
+            for session in sessions {
+                if !seen_session_ids.insert(session.id.clone()) {
+                    continue;
+                }
+
+                let inferred_state = query_inferred_state(&db_path, &session.id).await;
+                let is_root_session = session.id == root_session.id;
+
+                active_sessions.push(ActiveSession {
+                    session_id: session.id,
+                    parent_id: session.parent_id,
+                    title: session.title,
+                    directory: session.directory,
+                    project_id: project_id.clone(),
+                    inferred_state,
+                    time_updated_ms: session.time_updated_ms,
+                    tui_pid: tui.pid,
+                    tmux_session: is_root_session.then(|| tui.tmux_session.clone()).flatten(),
+                    tmux_window: is_root_session.then(|| tui.tmux_window.clone()).flatten(),
+                    tmux_window_index: is_root_session.then_some(tui.tmux_window_index).flatten(),
+                    tmux_pane_index: is_root_session.then_some(tui.tmux_pane_index).flatten(),
+                    tmux_pane_tty: is_root_session.then(|| tui.tmux_pane_tty.clone()).flatten(),
+                });
             }
-            let inferred_state = query_inferred_state(&db_path, &session.id).await;
-            active_sessions.push(ActiveSession {
-                session_id: session.id,
-                title: session.title,
-                directory: session.directory,
-                project_id,
-                inferred_state,
-                time_updated_ms: session.time_updated_ms,
-                tui_pid: tui.pid,
-                tmux_session: tui.tmux_session.clone(),
-                tmux_window: tui.tmux_window.clone(),
-                tmux_window_index: tui.tmux_window_index,
-                tmux_pane_index: tui.tmux_pane_index,
-                tmux_pane_tty: tui.tmux_pane_tty.clone(),
-            });
         }
     }
 
@@ -338,12 +349,16 @@ async fn resolve_project_id(cwd: &str) -> Option<String> {
 
 // ─── SQLite Session Query ─────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct DbSession {
     id: String,
+    parent_id: Option<String>,
     title: String,
     directory: String,
     time_updated_ms: u64,
 }
+
+const LOCAL_INFERRED_STATE_LOOKBACK_ROWS: usize = 32;
 
 fn opencode_db_path() -> String {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
@@ -393,7 +408,7 @@ pub async fn recent_directories(limit: usize) -> Vec<RecentDirEntry> {
 
 async fn query_latest_session(db_path: &str, project_id: &str) -> Option<DbSession> {
     let query = format!(
-        "SELECT id, title, directory, time_updated \
+        "SELECT id, COALESCE(parent_id, ''), title, directory, time_updated \
          FROM session \
          WHERE project_id = '{}' AND parent_id IS NULL \
          ORDER BY time_updated DESC LIMIT 1",
@@ -420,23 +435,77 @@ async fn query_latest_session(db_path: &str, project_id: &str) -> Option<DbSessi
         return None;
     }
 
-    let parts: Vec<&str> = line.splitn(4, '|').collect();
-    if parts.len() < 4 {
+    let parts: Vec<&str> = line.splitn(5, '|').collect();
+    if parts.len() < 5 {
         return None;
     }
 
     Some(DbSession {
         id: parts[0].to_string(),
-        title: parts[1].to_string(),
-        directory: parts[2].to_string(),
-        time_updated_ms: parts[3].parse().unwrap_or(0),
+        parent_id: (!parts[1].is_empty()).then(|| parts[1].to_string()),
+        title: parts[2].to_string(),
+        directory: parts[3].to_string(),
+        time_updated_ms: parts[4].parse().unwrap_or(0),
     })
+}
+
+async fn query_session_tree(db_path: &str, root_session_id: &str) -> Option<Vec<DbSession>> {
+    let query = format!(
+        "WITH RECURSIVE session_tree(id, parent_id, title, directory, time_updated) AS ( \
+             SELECT id, parent_id, title, directory, time_updated \
+             FROM session \
+             WHERE id = '{}' \
+             UNION ALL \
+             SELECT child.id, child.parent_id, child.title, child.directory, child.time_updated \
+             FROM session child \
+             JOIN session_tree parent ON child.parent_id = parent.id \
+         ) \
+         SELECT id, COALESCE(parent_id, ''), title, directory, time_updated \
+         FROM session_tree \
+         ORDER BY CASE WHEN parent_id IS NULL THEN 0 ELSE 1 END, time_updated DESC",
+        root_session_id.replace('\'', "''")
+    );
+
+    let output = Command::new("sqlite3")
+        .args(["-separator", "|", db_path, &query])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        tracing::debug!(
+            "sqlite3 session tree query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.splitn(5, '|').collect();
+                if parts.len() < 5 {
+                    return None;
+                }
+
+                Some(DbSession {
+                    id: parts[0].to_string(),
+                    parent_id: (!parts[1].is_empty()).then(|| parts[1].to_string()),
+                    title: parts[2].to_string(),
+                    directory: parts[3].to_string(),
+                    time_updated_ms: parts[4].parse().unwrap_or(0),
+                })
+            })
+            .collect(),
+    )
 }
 
 async fn query_inferred_state(db_path: &str, session_id: &str) -> Option<crate::types::SessionState> {
     let query = format!(
-        "SELECT data FROM part WHERE session_id = '{}' ORDER BY time_updated DESC LIMIT 1",
-        session_id.replace('\'', "''")
+        "SELECT hex(data) FROM part WHERE session_id = '{}' ORDER BY time_updated DESC LIMIT {}",
+        session_id.replace('\'', "''"),
+        LOCAL_INFERRED_STATE_LOOKBACK_ROWS,
     );
 
     let output = Command::new("sqlite3")
@@ -449,8 +518,10 @@ async fn query_inferred_state(db_path: &str, session_id: &str) -> Option<crate::
         return None;
     }
 
-    let part_data = String::from_utf8_lossy(&output.stdout);
-    infer_session_state_from_part(part_data.trim())
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(decode_sqlite_hex_payload)
+        .find_map(|part| infer_session_state_from_part(&part))
 }
 
 // ─── Port Discovery (for server processes) ────────────────────────────────────
@@ -481,10 +552,12 @@ async fn discover_port_from_cmdline(pid: u32) -> Option<u16> {
 
     for (i, part) in parts.iter().enumerate() {
         if *part == "--port" {
-            return parts.get(i + 1)?.parse().ok();
+            let port = parts.get(i + 1)?.parse().ok()?;
+            return (port > 1024).then_some(port);
         }
         if let Some(port_str) = part.strip_prefix("--port=") {
-            return port_str.parse().ok();
+            let port = port_str.parse().ok()?;
+            return (port > 1024).then_some(port);
         }
     }
 

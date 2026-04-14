@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crate::discovery::{
-    ActiveSession, DiscoveredInstance, ScanResult, TmuxPane, discover_port_from_lsof,
-    infer_session_state_from_part,
+    decode_sqlite_hex_payload, discover_port_from_lsof, infer_session_state_from_part,
+    ActiveSession, DiscoveredInstance, ScanResult, TmuxPane,
 };
 use crate::ipc::RecentDirEntry;
 use crate::ssh::SshManager;
@@ -11,6 +11,15 @@ use std::collections::{HashMap, HashSet};
 struct RemoteProcess {
     pid: u32,
     cmdline: String,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteDbSession {
+    id: String,
+    parent_id: Option<String>,
+    title: String,
+    directory: String,
+    time_updated_ms: u64,
 }
 
 /// Scan a remote host for active OpenCode sessions using the new TUI-based detection.
@@ -120,50 +129,54 @@ async fn try_scan_remote_v2(
             continue;
         }
 
-        let db_query = format!(
-            "sqlite3 -separator '|' ~/.local/share/opencode/opencode.db \
-             \"SELECT id, title, directory, time_updated \
-              FROM session \
-              WHERE project_id = '{}' AND parent_id IS NULL \
-              ORDER BY time_updated DESC LIMIT 1\"",
-            project_id.replace('\'', "''")
-        );
-        let db_output = ssh_manager.exec(host_name, &db_query).await.unwrap_or_default();
-        let db_output = db_output.trim();
-        if db_output.is_empty() {
+        let Some(root_session) = query_remote_latest_session(ssh_manager, host_name, &project_id).await else {
             continue;
-        }
+        };
 
-        let parts: Vec<&str> = db_output.splitn(4, '|').collect();
-        if parts.len() < 4 {
-            continue;
-        }
-
-        let session_id = parts[0].to_string();
-        if !seen_session_ids.insert(session_id.clone()) {
-            continue;
-        }
-
-        let inferred_state = query_remote_inferred_state(ssh_manager, host_name, &session_id).await;
+        let sessions = query_remote_session_tree(ssh_manager, host_name, &root_session.id)
+            .await
+            .filter(|sessions| !sessions.is_empty())
+            .unwrap_or_else(|| vec![root_session.clone()]);
 
         let tmux_pane = get_remote_process_tty(ssh_manager, host_name, *pid)
             .await
             .and_then(|tty| tmux_panes_by_tty.get(&tty).cloned());
 
-        active_sessions.push(ActiveSession {
-            session_id,
-            title: parts[1].to_string(),
-            directory: parts[2].to_string(),
-            project_id: project_id.clone(),
-            inferred_state,
-            time_updated_ms: parts[3].parse().unwrap_or(0),
-            tui_pid: *pid,
-            tmux_session: tmux_pane.as_ref().map(|pane| pane.session_name.clone()),
-            tmux_window: tmux_pane.as_ref().map(|pane| pane.window_name.clone()),
-            tmux_window_index: tmux_pane.as_ref().map(|pane| pane.window_index),
-            tmux_pane_index: tmux_pane.as_ref().map(|pane| pane.pane_index),
-            tmux_pane_tty: tmux_pane.as_ref().map(|pane| pane.pane_tty.clone()),
-        });
+        for session in sessions {
+            if !seen_session_ids.insert(session.id.clone()) {
+                continue;
+            }
+
+            let inferred_state =
+                query_remote_inferred_state(ssh_manager, host_name, &session.id).await;
+            let is_root_session = session.id == root_session.id;
+
+            active_sessions.push(ActiveSession {
+                session_id: session.id,
+                parent_id: session.parent_id,
+                title: session.title,
+                directory: session.directory,
+                project_id: project_id.clone(),
+                inferred_state,
+                time_updated_ms: session.time_updated_ms,
+                tui_pid: *pid,
+                tmux_session: is_root_session
+                    .then(|| tmux_pane.as_ref().map(|pane| pane.session_name.clone()))
+                    .flatten(),
+                tmux_window: is_root_session
+                    .then(|| tmux_pane.as_ref().map(|pane| pane.window_name.clone()))
+                    .flatten(),
+                tmux_window_index: is_root_session
+                    .then_some(tmux_pane.as_ref().map(|pane| pane.window_index))
+                    .flatten(),
+                tmux_pane_index: is_root_session
+                    .then_some(tmux_pane.as_ref().map(|pane| pane.pane_index))
+                    .flatten(),
+                tmux_pane_tty: is_root_session
+                    .then(|| tmux_pane.as_ref().map(|pane| pane.pane_tty.clone()))
+                    .flatten(),
+            });
+        }
     }
 
     let current_ports: Vec<u16> = current_remote_ports.into_iter().collect();
@@ -241,13 +254,81 @@ fn extract_port_from_cmdline(cmdline: &str) -> Option<u16> {
     let parts: Vec<&str> = cmdline.split_whitespace().collect();
     for (i, part) in parts.iter().enumerate() {
         if *part == "--port" {
-            return parts.get(i + 1)?.parse().ok();
+            let port = parts.get(i + 1)?.parse().ok()?;
+            return (port > 1024).then_some(port);
         }
         if let Some(port_str) = part.strip_prefix("--port=") {
-            return port_str.parse().ok();
+            let port = port_str.parse().ok()?;
+            return (port > 1024).then_some(port);
         }
     }
     None
+}
+
+const REMOTE_INFERRED_STATE_LOOKBACK_ROWS: usize = 32;
+
+async fn query_remote_latest_session(
+    ssh_manager: &SshManager,
+    host_name: &str,
+    project_id: &str,
+) -> Option<RemoteDbSession> {
+    let query = format!(
+        "sqlite3 -separator '|' ~/.local/share/opencode/opencode.db \
+         \"SELECT id, COALESCE(parent_id, ''), title, directory, time_updated \
+          FROM session \
+          WHERE project_id = '{}' AND parent_id IS NULL \
+          ORDER BY time_updated DESC LIMIT 1\"",
+        project_id.replace('\'', "''")
+    );
+
+    let output = ssh_manager.exec(host_name, &query).await.ok()?;
+    parse_remote_db_sessions(&output).into_iter().next()
+}
+
+async fn query_remote_session_tree(
+    ssh_manager: &SshManager,
+    host_name: &str,
+    root_session_id: &str,
+) -> Option<Vec<RemoteDbSession>> {
+    let query = format!(
+        "sqlite3 -separator '|' ~/.local/share/opencode/opencode.db \
+         \"WITH RECURSIVE session_tree(id, parent_id, title, directory, time_updated) AS ( \
+              SELECT id, parent_id, title, directory, time_updated \
+              FROM session \
+              WHERE id = '{}' \
+              UNION ALL \
+              SELECT child.id, child.parent_id, child.title, child.directory, child.time_updated \
+              FROM session child \
+              JOIN session_tree parent ON child.parent_id = parent.id \
+          ) \
+          SELECT id, COALESCE(parent_id, ''), title, directory, time_updated \
+          FROM session_tree \
+          ORDER BY CASE WHEN parent_id IS NULL THEN 0 ELSE 1 END, time_updated DESC\"",
+        root_session_id.replace('\'', "''")
+    );
+
+    let output = ssh_manager.exec(host_name, &query).await.ok()?;
+    Some(parse_remote_db_sessions(&output))
+}
+
+fn parse_remote_db_sessions(output: &str) -> Vec<RemoteDbSession> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(5, '|').collect();
+            if parts.len() < 5 {
+                return None;
+            }
+
+            Some(RemoteDbSession {
+                id: parts[0].to_string(),
+                parent_id: (!parts[1].is_empty()).then(|| parts[1].to_string()),
+                title: parts[2].to_string(),
+                directory: parts[3].to_string(),
+                time_updated_ms: parts[4].parse().unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 async fn query_remote_inferred_state(
@@ -256,11 +337,16 @@ async fn query_remote_inferred_state(
     session_id: &str,
 ) -> Option<crate::types::SessionState> {
     let query = format!(
-        "sqlite3 ~/.local/share/opencode/opencode.db \"SELECT data FROM part WHERE session_id = '{}' ORDER BY time_updated DESC LIMIT 1\"",
-        session_id.replace('\'', "''")
+        "sqlite3 ~/.local/share/opencode/opencode.db \"SELECT hex(data) FROM part WHERE session_id = '{}' ORDER BY time_updated DESC LIMIT {}\"",
+        session_id.replace('\'', "''"),
+        REMOTE_INFERRED_STATE_LOOKBACK_ROWS,
     );
     let output = ssh_manager.exec(host_name, &query).await.ok()?;
-    infer_session_state_from_part(output.trim())
+
+    output
+        .lines()
+        .filter_map(decode_sqlite_hex_payload)
+        .find_map(|part| infer_session_state_from_part(&part))
 }
 
 pub async fn reconcile_port_forwards(

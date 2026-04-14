@@ -104,6 +104,9 @@ pub struct SessionInfo {
     pub host: String,
     /// Current session state
     pub state: SessionState,
+    /// Parent session ID for nested/background agents.
+    #[serde(default)]
+    pub parent_id: Option<String>,
     /// Session title (first user prompt or user-defined)
     pub title: String,
     /// Working directory for this session

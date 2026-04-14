@@ -35,6 +35,7 @@ pub struct ScanResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSession {
     pub session_id: String,
+    pub parent_id: Option<String>,
     pub title: String,
     pub directory: String,
     pub project_id: String,
@@ -47,6 +48,21 @@ pub struct ActiveSession {
     pub tmux_window_index: Option<u32>,
     pub tmux_pane_index: Option<u32>,
     pub tmux_pane_tty: Option<String>,
+}
+
+pub fn decode_sqlite_hex_payload(hex: &str) -> Option<String> {
+    let hex = hex.trim();
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        bytes.push(u8::from_str_radix(pair, 16).ok()?);
+    }
+
+    String::from_utf8(bytes).ok()
 }
 
 pub fn infer_session_state_from_part(part_data: &str) -> Option<SessionState> {
