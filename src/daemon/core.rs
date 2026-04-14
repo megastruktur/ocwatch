@@ -787,6 +787,8 @@ impl DaemonCore {
                 }
             }
             ClientMessage::RefreshAll => {
+                self.pending_scan_targets.clear();
+                self.rescan_requested = false;
                 self.scan_all_hosts().await;
                 let _ = ipc::send_message(&mut write_half, &self.state_snapshot()).await;
             }
