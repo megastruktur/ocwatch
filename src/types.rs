@@ -151,7 +151,7 @@ pub struct HostStatus {
     pub connected: bool,
     /// Number of active sessions on this host
     pub session_count: usize,
-    /// Unix timestamp millis of last successful poll
+    /// Unix timestamp millis of the last completed poll attempt
     /// NOTE: Option<u64> not Option<Instant> — Serialize/Deserialize safe
     pub last_poll_unix_ms: Option<u64>,
     /// Last error message if not connected

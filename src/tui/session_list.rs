@@ -72,7 +72,17 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     }
 
     if app.sessions.is_empty() {
-        let widget = Paragraph::new("No sessions found\n\nStart OpenCode:\n  opencode --port 0")
+        let is_loading = app.hosts.is_empty()
+            || app
+                .hosts
+                .iter()
+                .any(|host| host.last_poll_unix_ms.is_none());
+        let empty_state = if is_loading {
+            "Scanning hosts…\n\nSessions will appear as each host responds."
+        } else {
+            "No sessions found\n\nStart OpenCode:\n  opencode --port 0"
+        };
+        let widget = Paragraph::new(empty_state)
             .block(block)
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(widget, area);

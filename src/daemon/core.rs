@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
-use crate::config::Config;
+use crate::config::{Config, HostConfig};
 use crate::daemon::bell::BellNotifier;
 use crate::daemon::recent_dirs::RecentDirStore;
 use crate::discovery::{local, remote, ActiveSession, ScanResult};
@@ -18,6 +18,11 @@ use crate::types::{HostStatus, SessionInfo, SessionState};
 struct SessionRuntime {
     last_state: SessionState,
     oc_base_url: String,
+}
+
+enum ScanTarget {
+    Local,
+    Remote(HostConfig),
 }
 
 pub struct DaemonCore {
@@ -64,12 +69,14 @@ impl DaemonCore {
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
             .context("Failed to set socket permissions")?;
 
-        // Initial scan of all hosts
-        self.scan_all_hosts().await;
+        self.ensure_host_placeholders();
 
         let mut poll_interval = tokio::time::interval(Duration::from_secs(
             self.config.poll_interval_secs as u64,
         ));
+        let mut pending_scan_targets = VecDeque::new();
+        let mut rescan_requested = false;
+        self.enqueue_scan_cycle(&mut pending_scan_targets);
 
         let mut sigterm = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
@@ -84,6 +91,7 @@ impl DaemonCore {
 
         loop {
             tokio::select! {
+                biased;
                 _ = sigterm.recv() => {
                     tracing::info!("SIGTERM received, shutting down");
                     break;
@@ -91,10 +99,6 @@ impl DaemonCore {
                 _ = sigint.recv() => {
                     tracing::info!("SIGINT received, shutting down");
                     break;
-                }
-                _ = poll_interval.tick() => {
-                    self.scan_all_hosts().await;
-                    self.broadcast_snapshot();
                 }
                 result = listener.accept() => {
                     match result {
@@ -106,6 +110,24 @@ impl DaemonCore {
                         }
                     }
                 }
+                _ = std::future::ready(()), if !pending_scan_targets.is_empty() => {
+                    if let Some(target) = pending_scan_targets.pop_front() {
+                        self.scan_target(target).await;
+                        self.broadcast_snapshot();
+                    }
+
+                    if pending_scan_targets.is_empty() && rescan_requested {
+                        rescan_requested = false;
+                        self.enqueue_scan_cycle(&mut pending_scan_targets);
+                    }
+                }
+                _ = poll_interval.tick() => {
+                    if pending_scan_targets.is_empty() {
+                        self.enqueue_scan_cycle(&mut pending_scan_targets);
+                    } else {
+                        rescan_requested = true;
+                    }
+                }
             }
         }
 
@@ -115,36 +137,77 @@ impl DaemonCore {
     }
 
     async fn scan_all_hosts(&mut self) {
-        let local_scan = local::scan_local().await;
-        self.update_from_scan("local", &local_scan, true, None)
-            .await;
+        self.ensure_host_placeholders();
 
-        let host_configs: Vec<_> = self
-            .config
-            .hosts
-            .iter()
-            .filter(|h| h.ssh_target.is_some())
-            .cloned()
-            .collect();
+        let mut pending_scan_targets = VecDeque::new();
+        self.enqueue_scan_cycle(&mut pending_scan_targets);
 
-        for host_config in host_configs {
-            let host_name = host_config.name.clone();
+        while let Some(target) = pending_scan_targets.pop_front() {
+            self.scan_target(target).await;
+            self.broadcast_snapshot();
+        }
+    }
 
-            if !self.ssh_manager.is_connected(&host_name).await {
-                if let Err(e) = self.ssh_manager.connect(&host_config).await {
-                    tracing::warn!("SSH connect to {} failed: {}", host_name, e);
-                    self.mark_host_unreachable(&host_name, e.to_string());
-                    continue;
-                }
+    fn enqueue_scan_cycle(&self, pending_scan_targets: &mut VecDeque<ScanTarget>) {
+        pending_scan_targets.push_back(ScanTarget::Local);
+        pending_scan_targets.extend(
+            self.config
+                .hosts
+                .iter()
+                .filter(|host| host.ssh_target.is_some())
+                .cloned()
+                .map(ScanTarget::Remote),
+        );
+    }
+
+    fn ensure_host_placeholders(&mut self) {
+        self.hosts.entry("local".to_string()).or_insert(HostStatus {
+            name: "local".to_string(),
+            connected: false,
+            session_count: 0,
+            last_poll_unix_ms: None,
+            error: None,
+        });
+
+        for host_name in self.configured_remote_hosts() {
+            self.hosts.entry(host_name.clone()).or_insert(HostStatus {
+                name: host_name,
+                connected: false,
+                session_count: 0,
+                last_poll_unix_ms: None,
+                error: None,
+            });
+        }
+    }
+
+    async fn scan_target(&mut self, target: ScanTarget) {
+        match target {
+            ScanTarget::Local => {
+                let local_scan = local::scan_local().await;
+                self.update_from_scan("local", &local_scan, true, None).await;
             }
+            ScanTarget::Remote(host_config) => {
+                let host_name = host_config.name.clone();
 
-            let scan = remote::scan_remote_v2(&mut self.ssh_manager, &host_name).await;
-            self.update_from_scan(&host_name, &scan, true, None)
-                .await;
+                if !self.ssh_manager.is_connected(&host_name).await {
+                    if let Err(error) = self.ssh_manager.connect(&host_config).await {
+                        tracing::warn!("SSH connect to {} failed: {}", host_name, error);
+                        self.mark_host_unreachable(&host_name, error.to_string());
+                        return;
+                    }
+                }
+
+                let scan = remote::scan_remote_v2(&mut self.ssh_manager, &host_name).await;
+                self.update_from_scan(&host_name, &scan, true, None).await;
+            }
         }
     }
 
     fn mark_host_unreachable(&mut self, host_name: &str, error: String) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         self.remove_host_sessions(host_name);
         self.hosts.insert(
             host_name.to_string(),
@@ -152,7 +215,7 @@ impl DaemonCore {
                 name: host_name.to_string(),
                 connected: false,
                 session_count: 0,
-                last_poll_unix_ms: None,
+                last_poll_unix_ms: Some(now_ms),
                 error: Some(error),
             },
         );
