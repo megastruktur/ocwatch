@@ -70,6 +70,7 @@ async fn try_scan_local_tmux() -> Result<Vec<DiscoveredInstance>> {
         instances.push(DiscoveredInstance {
             pid: oc_pid,
             port,
+            remote_port: None,
             tmux_session: Some(pane.session_name),
             tmux_window: Some(pane.window_name),
             tmux_window_index: Some(pane.window_index),

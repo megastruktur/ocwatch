@@ -118,8 +118,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_tui() -> Result<()> {
-    eprintln!("TUI not yet implemented — Task 11");
-    Ok(())
+    tui::run_tui().await
 }
 
 async fn run_approve(session_id: &str) -> Result<()> {
@@ -134,8 +133,20 @@ async fn debug_scan_local() -> Result<()> {
 }
 
 async fn debug_scan_remote(host: &str) -> Result<()> {
-    eprintln!("scan-remote not yet implemented — Task 9");
-    println!("[]");
+    let config = config::Config::load()?;
+    let host_config = config
+        .hosts
+        .iter()
+        .find(|h| h.name == host)
+        .ok_or_else(|| anyhow::anyhow!("Host '{}' not found in config", host))?;
+
+    let mut ssh_manager = ssh::SshManager::new();
+    ssh_manager.connect(host_config).await?;
+
+    let instances = discovery::remote::scan_remote(&mut ssh_manager, host).await;
+    println!("{}", serde_json::to_string_pretty(&instances)?);
+
+    ssh_manager.disconnect_all().await;
     Ok(())
 }
 

@@ -240,6 +240,14 @@ impl SshManager {
         Ok(local_port)
     }
 
+    /// List remote ports currently forwarded for a host.
+    pub fn forwarded_remote_ports(&self, host_name: &str) -> Vec<u16> {
+        self.connections
+            .get(host_name)
+            .map(|conn| conn.forwarded_ports.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// Remove an SSH port forward.
     pub async fn unforward_port(&mut self, host_name: &str, remote_port: u16) {
         if let Some(conn) = self.connections.get_mut(host_name) {
