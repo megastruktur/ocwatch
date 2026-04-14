@@ -33,6 +33,7 @@ pub struct DaemonCore {
     hosts: HashMap<String, HostStatus>,
     pending_scan_targets: VecDeque<ScanTarget>,
     rescan_requested: bool,
+    refresh_waiters: Vec<tokio::sync::oneshot::Sender<DaemonMessage>>,
     broadcast_tx: BroadcastTx,
     started_at: Instant,
     bell_notifier: BellNotifier,
@@ -53,6 +54,7 @@ impl DaemonCore {
             hosts: HashMap::new(),
             pending_scan_targets: VecDeque::new(),
             rescan_requested: false,
+            refresh_waiters: Vec::new(),
             broadcast_tx,
             started_at: Instant::now(),
             bell_notifier: BellNotifier::new(),
@@ -119,9 +121,13 @@ impl DaemonCore {
                         self.broadcast_snapshot();
                     }
 
-                    if self.pending_scan_targets.is_empty() && self.rescan_requested {
-                        self.rescan_requested = false;
-                        self.enqueue_scan_cycle();
+                    if self.pending_scan_targets.is_empty() {
+                        self.notify_refresh_waiters();
+
+                        if self.rescan_requested {
+                            self.rescan_requested = false;
+                            self.enqueue_scan_cycle();
+                        }
                     }
                 }
                 _ = poll_interval.tick() => {
@@ -154,6 +160,17 @@ impl DaemonCore {
             self.enqueue_scan_cycle();
         } else {
             self.rescan_requested = true;
+        }
+    }
+
+    fn notify_refresh_waiters(&mut self) {
+        if self.refresh_waiters.is_empty() {
+            return;
+        }
+
+        let snapshot = self.state_snapshot();
+        for waiter in self.refresh_waiters.drain(..) {
+            let _ = waiter.send(snapshot.clone());
         }
     }
 
@@ -368,11 +385,13 @@ impl DaemonCore {
 
     /// Broadcast a full state snapshot to all connected clients.
     fn broadcast_snapshot(&self) {
+        let _ = self.broadcast_tx.send(self.state_snapshot());
+    }
+
+    fn state_snapshot(&self) -> DaemonMessage {
         let sessions: Vec<SessionInfo> = self.sessions.values().cloned().collect();
         let hosts: Vec<HostStatus> = self.hosts.values().cloned().collect();
-        let _ = self
-            .broadcast_tx
-            .send(DaemonMessage::StateSnapshot { sessions, hosts });
+        DaemonMessage::StateSnapshot { sessions, hosts }
     }
 
     /// Build a DaemonStatus response.
@@ -766,11 +785,15 @@ impl DaemonCore {
                 self.pending_scan_targets.clear();
                 self.rescan_requested = false;
                 self.request_scan_cycle();
-                let snapshot = DaemonMessage::StateSnapshot {
-                    sessions: self.sessions.values().cloned().collect(),
-                    hosts: self.hosts.values().cloned().collect(),
-                };
-                let _ = ipc::send_message(&mut write_half, &snapshot).await;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.refresh_waiters.push(tx);
+
+                tokio::spawn(async move {
+                    let Ok(snapshot) = rx.await else {
+                        return;
+                    };
+                    let _ = ipc::send_message(&mut write_half, &snapshot).await;
+                });
             }
             ClientMessage::GetRecentDirs { limit } => {
                 let missing_hosts = self.has_missing_recent_dir_hosts();
