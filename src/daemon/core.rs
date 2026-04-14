@@ -172,22 +172,31 @@ impl DaemonCore {
         let statuses = if let Some(port) = scan.server_port {
             let base_url = format!("http://localhost:{}", port);
             match OcClient::new(&base_url) {
-                Ok(client) => client.get_session_statuses().await.unwrap_or_default(),
-                Err(_) => HashMap::new(),
+                Ok(client) => client.get_session_statuses().await.ok(),
+                Err(_) => None,
             }
         } else {
-            HashMap::new()
+            None
         };
 
         for active in &scan.active_sessions {
-            let state = OcClient::session_state_from_status(&active.session_id, &statuses);
+            let inferred_state = active.inferred_state.clone();
+            let state = match &statuses {
+                Some(statuses) => statuses
+                    .get(&active.session_id)
+                    .and_then(|status| status.status.as_deref())
+                    .map(SessionState::from_oc_str)
+                    .or(inferred_state.clone())
+                    .unwrap_or(SessionState::Idle),
+                None => inferred_state.unwrap_or(SessionState::Disconnected),
+            };
             let key = format!("{}:{}", host, active.session_id);
             seen_keys.insert(key.clone());
 
             let oc_port = scan.server_port.unwrap_or(0);
-            let base_url = format!("http://localhost:{}", oc_port);
+            let oc_base_url = format!("http://localhost:{}", oc_port);
 
-            let uptime_secs = {
+            let activity_age_secs = {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -200,13 +209,8 @@ impl DaemonCore {
                 host: host.to_string(),
                 state: state.clone(),
                 title: active.title.clone(),
-                model: None,
                 working_dir: active.directory.clone(),
-                tokens_in: 0,
-                tokens_out: 0,
-                tokens_cache: 0,
-                current_tool: None,
-                uptime_secs,
+                activity_age_secs,
                 oc_port,
                 tmux_session: active.tmux_session.clone(),
                 tmux_window: active.tmux_window.clone(),
@@ -240,7 +244,7 @@ impl DaemonCore {
                 key.clone(),
                 SessionRuntime {
                     last_state: state.clone(),
-                    oc_base_url: base_url,
+                    oc_base_url,
                 },
             );
 

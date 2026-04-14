@@ -106,19 +106,12 @@ pub struct SessionInfo {
     pub state: SessionState,
     /// Session title (first user prompt or user-defined)
     pub title: String,
-    /// AI model being used (e.g. "claude-sonnet-4-6") — may be None until first message
-    pub model: Option<String>,
     /// Working directory for this session
     pub working_dir: String,
-    /// Token counts — 0 if not yet available
-    pub tokens_in: u64,
-    pub tokens_out: u64,
-    pub tokens_cache: u64,
-    /// Current tool being executed, if any
-    pub current_tool: Option<String>,
-    /// Seconds since session was created (computed from OC time.created)
+    /// Seconds since the session metadata was last updated.
     /// NOTE: u64 not Duration — Serialize/Deserialize safe
-    pub uptime_secs: u64,
+    #[serde(default)]
+    pub activity_age_secs: u64,
     /// OpenCode HTTP API port (local or forwarded via SSH)
     pub oc_port: u16,
     /// tmux coordinates — None for remote sessions without tmux
@@ -133,9 +126,9 @@ impl SessionInfo {
         format!("{}:{}", self.host, self.id)
     }
 
-    /// Format uptime as human-readable string (e.g. "1h 23m", "45s")
-    pub fn uptime_human(&self) -> String {
-        let secs = self.uptime_secs;
+    /// Format last-activity age as human-readable string (e.g. "1h 23m", "45s")
+    pub fn activity_age_human(&self) -> String {
+        let secs = self.activity_age_secs;
         if secs < 60 {
             format!("{}s", secs)
         } else if secs < 3600 {

@@ -33,6 +33,20 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
+pub fn desired_height(app: &App, area_width: u16) -> u16 {
+    let inner_width = area_width.saturating_sub(2).max(1) as usize;
+
+    let content_height = match app.selected_session() {
+        Some(session) => build_detail_plain_lines(session)
+            .into_iter()
+            .map(|line| wrapped_line_count(&line, inner_width))
+            .sum::<usize>(),
+        None => 1,
+    };
+
+    u16::try_from(content_height.saturating_add(2)).unwrap_or(u16::MAX)
+}
+
 fn build_detail_lines(s: &SessionInfo) -> Vec<Line<'static>> {
     let state_color = match &s.state {
         SessionState::Idle => Color::Green,
@@ -58,23 +72,11 @@ fn build_detail_lines(s: &SessionInfo) -> Vec<Line<'static>> {
             Span::styled(s.state.to_string(), value),
         ]),
         row(label, value, "Host", &s.host),
-        row(label, value, "Model", s.model.as_deref().unwrap_or("—")),
-        row(label, value, "Dir", &truncate(&s.working_dir, 35)),
-        row(
-            label,
-            value,
-            "Tool",
-            s.current_tool.as_deref().unwrap_or("—"),
-        ),
-        row(label, value, "Uptime", &s.uptime_human()),
-        Line::raw(""),
-        Line::from(Span::styled("─── Tokens ─────────────────────", section)),
-        row(label, value, "Input", &fmt_num(s.tokens_in)),
-        row(label, value, "Output", &fmt_num(s.tokens_out)),
-        row(label, value, "Cache", &fmt_num(s.tokens_cache)),
+        row(label, value, "Dir", &s.working_dir),
+        row(label, value, "Updated", &s.activity_age_human()),
     ];
 
-    if s.tmux_session.is_some() {
+    if s.tmux_session.is_some() || s.tmux_window.is_some() || s.tmux_pane.is_some() {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "─── tmux ────────────────────────",
@@ -103,11 +105,53 @@ fn build_detail_lines(s: &SessionInfo) -> Vec<Line<'static>> {
     lines
 }
 
+fn build_detail_plain_lines(s: &SessionInfo) -> Vec<String> {
+    let mut lines = vec![
+        row_text("Title", &truncate(&s.title, 35)),
+        format!("State:   {} {}", s.state.icon(), s.state),
+        row_text("Host", &s.host),
+        row_text("Dir", &s.working_dir),
+        row_text("Updated", &s.activity_age_human()),
+    ];
+
+    if s.tmux_session.is_some() || s.tmux_window.is_some() || s.tmux_pane.is_some() {
+        lines.push(String::new());
+        lines.push("─── tmux ────────────────────────".to_string());
+        lines.push(row_text(
+            "Session",
+            s.tmux_session.as_deref().unwrap_or("—"),
+        ));
+        lines.push(row_text("Window", s.tmux_window.as_deref().unwrap_or("—")));
+        lines.push(row_text("Pane", s.tmux_pane.as_deref().unwrap_or("—")));
+    }
+
+    lines
+}
+
 fn row(label: Style, value: Style, key: &'static str, val: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{:<8} ", format!("{}:", key)), label),
+        Span::styled(row_prefix(key), label),
         Span::styled(val.to_string(), value),
     ])
+}
+
+fn row_text(key: &'static str, val: &str) -> String {
+    format!("{}{}", row_prefix(key), val)
+}
+
+fn row_prefix(key: &'static str) -> String {
+    format!("{:<8} ", format!("{}:", key))
+}
+
+fn wrapped_line_count(line: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let line_len = line.chars().count();
+
+    if line_len == 0 {
+        1
+    } else {
+        line_len.div_ceil(width)
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -115,13 +159,5 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(max - 1).collect::<String>())
-    }
-}
-
-fn fmt_num(n: u64) -> String {
-    if n == 0 {
-        "—".to_string()
-    } else {
-        format!("{}", n)
     }
 }

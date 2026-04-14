@@ -16,7 +16,7 @@ ocwatch is a daemon + TUI application written in Rust that auto-discovers OpenCo
 - Quick-approve pending permission requests from the TUI or CLI
 - Drop-in to any session: local tmux pane switch or remote SSH attach
 - Split-panel TUI: session list (grouped by host) on the left, session detail on the right
-- Session detail: state, model, working directory, token counts, tmux coordinates, uptime
+- Session detail: state, working directory, tmux coordinates, and recent activity age
 - Extensible `CodingAgent` trait — OpenCode adapter built-in, ready for future agents
 
 ## Prerequisites

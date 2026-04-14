@@ -1,5 +1,6 @@
 use crate::discovery::{
-    discover_port_from_lsof, parse_tmux_output, ActiveSession, DiscoveredInstance, ScanResult,
+    discover_port_from_lsof, infer_session_state_from_part, parse_tmux_output, ActiveSession,
+    DiscoveredInstance, ScanResult,
 };
 use anyhow::Result;
 use tokio::process::Command;
@@ -63,11 +64,13 @@ async fn try_scan_local() -> Result<ScanResult> {
             if !seen_session_ids.insert(session.id.clone()) {
                 continue;
             }
+            let inferred_state = query_inferred_state(&db_path, &session.id).await;
             active_sessions.push(ActiveSession {
                 session_id: session.id,
                 title: session.title,
                 directory: session.directory,
                 project_id,
+                inferred_state,
                 time_updated_ms: session.time_updated_ms,
                 tui_pid: tui.pid,
                 tmux_session: tui.tmux_session.clone(),
@@ -391,6 +394,26 @@ async fn query_latest_session(db_path: &str, project_id: &str) -> Option<DbSessi
         directory: parts[2].to_string(),
         time_updated_ms: parts[3].parse().unwrap_or(0),
     })
+}
+
+async fn query_inferred_state(db_path: &str, session_id: &str) -> Option<crate::types::SessionState> {
+    let query = format!(
+        "SELECT data FROM part WHERE session_id = '{}' ORDER BY time_updated DESC LIMIT 1",
+        session_id.replace('\'', "''")
+    );
+
+    let output = Command::new("sqlite3")
+        .args([db_path, &query])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let part_data = String::from_utf8_lossy(&output.stdout);
+    infer_session_state_from_part(part_data.trim())
 }
 
 // ─── Port Discovery (for server processes) ────────────────────────────────────

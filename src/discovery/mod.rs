@@ -1,3 +1,4 @@
+use crate::types::SessionState;
 use serde::{Deserialize, Serialize};
 
 pub mod local;
@@ -37,6 +38,7 @@ pub struct ActiveSession {
     pub title: String,
     pub directory: String,
     pub project_id: String,
+    pub inferred_state: Option<SessionState>,
     pub time_updated_ms: u64,
     /// PID of the TUI process viewing this session.
     pub tui_pid: u32,
@@ -45,6 +47,22 @@ pub struct ActiveSession {
     pub tmux_window_index: Option<u32>,
     pub tmux_pane_index: Option<u32>,
     pub tmux_pane_tty: Option<String>,
+}
+
+pub fn infer_session_state_from_part(part_data: &str) -> Option<SessionState> {
+    let data: serde_json::Value = serde_json::from_str(part_data).ok()?;
+    let part_type = data.get("type")?.as_str()?;
+
+    match part_type {
+        "tool" => match data.pointer("/state/status").and_then(|v| v.as_str()) {
+            Some("pending") | Some("running") => Some(SessionState::Busy),
+            Some("error") => Some(SessionState::Error),
+            _ => None,
+        },
+        "reasoning" | "step-start" => Some(SessionState::Busy),
+        "step-finish" => Some(SessionState::Idle),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]

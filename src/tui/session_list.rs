@@ -37,7 +37,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let (items, visual_to_session) = build_session_items(app);
+    let (items, visual_to_session) = build_session_items(app, area.width);
 
     // Map app.selected_index (session index) to visual list index
     let visual_selected = visual_to_session
@@ -59,8 +59,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn build_session_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>) {
+fn build_session_items(app: &App, area_width: u16) -> (Vec<ListItem<'static>>, Vec<Option<usize>>) {
     let by_host = group_session_indices_by_host(&app.sessions);
+    let title_width = area_width.saturating_sub(10) as usize;
 
     let mut items = Vec::new();
     let mut visual_to_session: Vec<Option<usize>> = Vec::new();
@@ -78,11 +79,17 @@ fn build_session_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>
         for idx in session_indices {
             let session = &app.sessions[idx];
             let (icon, color) = state_icon_color(&session.state);
-            let title = truncate(&session.title, 38);
+            let attention_marker = if app.session_has_attention(session) {
+                Span::styled("⚠ ", Style::default().fg(Color::Red))
+            } else {
+                Span::raw("  ")
+            };
+            let title = truncate(&session.title, title_width);
             let line = Line::from(vec![
                 Span::raw("  "),
                 Span::styled(icon.to_string(), Style::default().fg(color)),
                 Span::raw(" "),
+                attention_marker,
                 Span::raw(title),
             ]);
             items.push(ListItem::new(line));
@@ -122,6 +129,10 @@ fn state_icon_color(state: &SessionState) -> (&'static str, Color) {
 }
 
 fn truncate(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+
     if s.chars().count() <= max {
         s.to_string()
     } else {

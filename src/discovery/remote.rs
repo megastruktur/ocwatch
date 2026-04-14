@@ -1,5 +1,8 @@
 use anyhow::Result;
-use crate::discovery::{ActiveSession, DiscoveredInstance, ScanResult, TmuxPane, discover_port_from_lsof};
+use crate::discovery::{
+    ActiveSession, DiscoveredInstance, ScanResult, TmuxPane, discover_port_from_lsof,
+    infer_session_state_from_part,
+};
 use crate::ssh::SshManager;
 use std::collections::{HashMap, HashSet};
 
@@ -140,6 +143,8 @@ async fn try_scan_remote_v2(
             continue;
         }
 
+        let inferred_state = query_remote_inferred_state(ssh_manager, host_name, &session_id).await;
+
         let tmux_pane = get_remote_process_tty(ssh_manager, host_name, *pid)
             .await
             .and_then(|tty| tmux_panes_by_tty.get(&tty).cloned());
@@ -149,6 +154,7 @@ async fn try_scan_remote_v2(
             title: parts[1].to_string(),
             directory: parts[2].to_string(),
             project_id: project_id.clone(),
+            inferred_state,
             time_updated_ms: parts[3].parse().unwrap_or(0),
             tui_pid: *pid,
             tmux_session: tmux_pane.as_ref().map(|pane| pane.session_name.clone()),
@@ -241,6 +247,19 @@ fn extract_port_from_cmdline(cmdline: &str) -> Option<u16> {
         }
     }
     None
+}
+
+async fn query_remote_inferred_state(
+    ssh_manager: &SshManager,
+    host_name: &str,
+    session_id: &str,
+) -> Option<crate::types::SessionState> {
+    let query = format!(
+        "sqlite3 ~/.local/share/opencode/opencode.db \"SELECT data FROM part WHERE session_id = '{}' ORDER BY time_updated DESC LIMIT 1\"",
+        session_id.replace('\'', "''")
+    );
+    let output = ssh_manager.exec(host_name, &query).await.ok()?;
+    infer_session_state_from_part(output.trim())
 }
 
 pub async fn reconcile_port_forwards(

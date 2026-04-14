@@ -14,6 +14,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame, Terminal,
 };
+use std::collections::HashSet;
 use std::io;
 use std::time::{Duration, Instant};
 use tokio::io::BufReader;
@@ -45,6 +46,8 @@ pub struct App {
     daemon_tx: Option<mpsc::Sender<ClientMessage>>,
     /// Transient status message.
     status_msg: Option<StatusMsg>,
+    /// Sessions that recently raised an attention bell and have not been viewed yet.
+    attention_session_keys: HashSet<String>,
 }
 
 impl App {
@@ -57,6 +60,7 @@ impl App {
             daemon_connected: false,
             daemon_tx: None,
             status_msg: None,
+            attention_session_keys: HashSet::new(),
         }
     }
 
@@ -81,6 +85,16 @@ impl App {
         self.sessions.get(self.selected_index)
     }
 
+    pub fn session_has_attention(&self, session: &SessionInfo) -> bool {
+        self.attention_session_keys.contains(&session.key())
+    }
+
+    fn clear_attention_for_selected(&mut self) {
+        if let Some(session) = self.selected_session() {
+            self.attention_session_keys.remove(&session.key());
+        }
+    }
+
     pub fn move_down(&mut self) {
         let ordered = crate::tui::session_list::ordered_session_indices(&self.sessions);
         if ordered.is_empty() {
@@ -93,6 +107,7 @@ impl App {
             .unwrap_or(0);
         let next_pos = (current_pos + 1).min(ordered.len() - 1);
         self.selected_index = ordered[next_pos];
+        self.clear_attention_for_selected();
     }
 
     pub fn move_up(&mut self) {
@@ -107,6 +122,7 @@ impl App {
             .unwrap_or(0);
         let prev_pos = current_pos.saturating_sub(1);
         self.selected_index = ordered[prev_pos];
+        self.clear_attention_for_selected();
     }
 
     async fn send_to_daemon(&self, msg: ClientMessage) {
@@ -301,6 +317,9 @@ fn handle_daemon_message(app: &mut App, msg: DaemonMessage) {
             replace_sessions(app, sessions, hosts);
         }
         DaemonMessage::SessionUpdated { session } => {
+            if !session.state.should_bell() {
+                app.attention_session_keys.remove(&session.key());
+            }
             if let Some(existing) = app.sessions.iter_mut().find(|s| s.id == session.id) {
                 *existing = session;
             } else {
@@ -308,8 +327,16 @@ fn handle_daemon_message(app: &mut App, msg: DaemonMessage) {
             }
         }
         DaemonMessage::Bell {
-            session_id, reason, ..
+            session_id, host, reason,
         } => {
+            let key = format!("{}:{}", host, session_id);
+            if app
+                .selected_session()
+                .map(|session| session.key() != key)
+                .unwrap_or(true)
+            {
+                app.attention_session_keys.insert(key);
+            }
             app.set_status(
                 format!("⚠ {session_id} needs attention ({reason})"),
                 Duration::from_secs(10),
@@ -328,6 +355,14 @@ fn handle_daemon_message(app: &mut App, msg: DaemonMessage) {
 
 fn replace_sessions(app: &mut App, sessions: Vec<SessionInfo>, hosts: Vec<HostStatus>) {
     let selected_session_id = app.selected_session().map(|session| session.id.clone());
+
+    let live_attention_keys = sessions
+        .iter()
+        .filter(|session| session.state.should_bell())
+        .map(SessionInfo::key)
+        .collect::<HashSet<_>>();
+    app.attention_session_keys
+        .retain(|key| live_attention_keys.contains(key));
 
     app.sessions = sessions;
     app.hosts = hosts;
@@ -356,7 +391,7 @@ fn clamp_index(app: &mut App) {
 
 // ─── Rendering ─────────────────────────────────────────────────────────────────
 
-/// Main render function — lays out the 3-panel structure.
+/// Main render function — lays out the session list, detail panel, and status bar.
 fn render(f: &mut Frame, app: &App) {
     let area = f.area();
 
@@ -375,11 +410,18 @@ fn render(f: &mut Frame, app: &App) {
 
     let main_area = chunks[0];
     let status_area = chunks[1];
+    let min_session_list_height = 4;
+    let max_detail_height = main_area
+        .height
+        .saturating_sub(min_session_list_height)
+        .max(1);
+    let detail_height = crate::tui::detail::desired_height(app, main_area.width)
+        .min(max_detail_height);
 
-    // Horizontal split: session list (60%) | detail (40%)
+    // Vertical split: session list on top, detail panel below.
     let main_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(detail_height)])
         .split(main_area);
 
     render_session_list(f, app, main_chunks[0]);
