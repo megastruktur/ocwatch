@@ -81,11 +81,15 @@ pub async fn start_daemon() -> Result<()> {
         .try_clone()
         .context("Failed to clone log file handle")?;
 
+    use std::os::unix::process::CommandExt;
+
     let child = std::process::Command::new(&exe)
         .arg("daemon")
         .arg("run")
+        .stdin(std::process::Stdio::null())
         .stdout(stdout_log)
         .stderr(stderr_log)
+        .process_group(0)
         .spawn()
         .context("Failed to spawn daemon process")?;
 

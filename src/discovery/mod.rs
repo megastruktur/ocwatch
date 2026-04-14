@@ -16,6 +16,37 @@ pub struct DiscoveredInstance {
     pub tmux_pane_tty: Option<String>,
 }
 
+/// Result of scanning a host for active OpenCode sessions.
+/// Combines server discovery (for HTTP API access) with TUI process detection
+/// (for determining which sessions are actually active).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanResult {
+    /// OpenCode server port (local or forwarded). Used for status queries and actions.
+    pub server_port: Option<u16>,
+    /// Remote port before forwarding (for remote hosts only).
+    pub server_remote_port: Option<u16>,
+    /// Active sessions resolved from running TUI processes.
+    pub active_sessions: Vec<ActiveSession>,
+}
+
+/// A session confirmed active by a running TUI process.
+/// Resolved via: TUI PID → CWD → git root commit (= project_id) → SQLite query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveSession {
+    pub session_id: String,
+    pub title: String,
+    pub directory: String,
+    pub project_id: String,
+    pub time_updated_ms: u64,
+    /// PID of the TUI process viewing this session.
+    pub tui_pid: u32,
+    pub tmux_session: Option<String>,
+    pub tmux_window: Option<String>,
+    pub tmux_window_index: Option<u32>,
+    pub tmux_pane_index: Option<u32>,
+    pub tmux_pane_tty: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TmuxPane {
     pub pane_pid: u32,

@@ -5,7 +5,7 @@ use tokio::net::UnixListener;
 
 use crate::config::Config;
 use crate::daemon::bell::BellNotifier;
-use crate::discovery::{local, remote, DiscoveredInstance};
+use crate::discovery::{local, remote, ActiveSession, ScanResult};
 use crate::ipc::{self, BroadcastTx, ClientMessage, DaemonMessage};
 use crate::opencode::client::OcClient;
 use crate::ssh::SshManager;
@@ -90,7 +90,6 @@ impl DaemonCore {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _)) => {
-                            // NOTE: v1 handles client synchronously; subscribe blocks this loop.
                             self.handle_client(stream).await;
                         }
                         Err(e) => {
@@ -106,11 +105,9 @@ impl DaemonCore {
         Ok(())
     }
 
-    /// Scan all configured hosts and update session state.
     async fn scan_all_hosts(&mut self) {
-        // Always scan local
-        let local_instances = local::scan_local_tmux().await;
-        self.update_from_instances("local", &local_instances, true, None)
+        let local_scan = local::scan_local().await;
+        self.update_from_scan("local", &local_scan, true, None)
             .await;
 
         let host_configs: Vec<_> = self
@@ -132,8 +129,8 @@ impl DaemonCore {
                 }
             }
 
-            let instances = remote::scan_remote(&mut self.ssh_manager, &host_name).await;
-            self.update_from_instances(&host_name, &instances, true, None)
+            let scan = remote::scan_remote_v2(&mut self.ssh_manager, &host_name).await;
+            self.update_from_scan(&host_name, &scan, true, None)
                 .await;
         }
     }
@@ -158,11 +155,10 @@ impl DaemonCore {
         self.session_runtime.retain(|key, _| !key.starts_with(&prefix));
     }
 
-    /// Update sessions from discovered instances for a host.
-    async fn update_from_instances(
+    async fn update_from_scan(
         &mut self,
         host: &str,
-        instances: &[DiscoveredInstance],
+        scan: &ScanResult,
         connected: bool,
         error: Option<String>,
     ) {
@@ -171,103 +167,95 @@ impl DaemonCore {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        let mut session_count = 0;
         let mut seen_keys: HashSet<String> = HashSet::new();
 
-        for inst in instances {
-            let base_url = format!("http://localhost:{}", inst.port);
-            let client = match OcClient::new(&base_url) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("Failed to create OC client for {}: {}", base_url, e);
-                    continue;
-                }
+        let statuses = if let Some(port) = scan.server_port {
+            let base_url = format!("http://localhost:{}", port);
+            match OcClient::new(&base_url) {
+                Ok(client) => client.get_session_statuses().await.unwrap_or_default(),
+                Err(_) => HashMap::new(),
+            }
+        } else {
+            HashMap::new()
+        };
+
+        for active in &scan.active_sessions {
+            let state = OcClient::session_state_from_status(&active.session_id, &statuses);
+            let key = format!("{}:{}", host, active.session_id);
+            seen_keys.insert(key.clone());
+
+            let oc_port = scan.server_port.unwrap_or(0);
+            let base_url = format!("http://localhost:{}", oc_port);
+
+            let uptime_secs = {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                now.saturating_sub(active.time_updated_ms) / 1000
             };
 
-            let oc_sessions = match client.list_sessions().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Failed to list sessions at {}: {}", base_url, e);
-                    continue;
-                }
+            let info = SessionInfo {
+                id: active.session_id.clone(),
+                host: host.to_string(),
+                state: state.clone(),
+                title: active.title.clone(),
+                model: None,
+                working_dir: active.directory.clone(),
+                tokens_in: 0,
+                tokens_out: 0,
+                tokens_cache: 0,
+                current_tool: None,
+                uptime_secs,
+                oc_port,
+                tmux_session: active.tmux_session.clone(),
+                tmux_window: active.tmux_window.clone(),
+                tmux_pane: active.tmux_pane_index.map(|i| i.to_string()),
             };
 
-            let statuses = match client.get_session_statuses().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Failed to get session statuses at {}: {}", base_url, e);
-                    HashMap::new()
-                }
-            };
+            let prev_state = self
+                .session_runtime
+                .get(&key)
+                .map(|r| r.last_state.clone());
 
-            for oc_session in oc_sessions {
-                let state = OcClient::session_state_from_status(&oc_session.id, &statuses);
-                let key = format!("{}:{}", host, oc_session.id);
-                seen_keys.insert(key.clone());
-
-                let info = SessionInfo {
-                    id: oc_session.id.clone(),
-                    host: host.to_string(),
-                    state: state.clone(),
-                    title: oc_session.title.clone(),
-                    model: None,
-                    working_dir: oc_session.directory.clone(),
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    tokens_cache: 0,
-                    current_tool: None,
-                    uptime_secs: oc_session.uptime_secs(),
-                    oc_port: inst.port,
-                    tmux_session: inst.tmux_session.clone(),
-                    tmux_window: inst.tmux_window.clone(),
-                    tmux_pane: inst.tmux_pane_index.map(|i| i.to_string()),
+            if let Some(prev) = prev_state {
+                let reason = match &state {
+                    SessionState::Idle => "idle",
+                    SessionState::WaitingForPermission => "permission",
+                    SessionState::WaitingForInput => "input",
+                    SessionState::Error => "error",
+                    _ => "attention",
                 };
-
-                let prev_state = self
-                    .session_runtime
-                    .get(&key)
-                    .map(|r| r.last_state.clone());
-
-                if let Some(prev) = prev_state {
-                    let reason = match &state {
-                        SessionState::Idle => "idle",
-                        SessionState::WaitingForPermission => "permission",
-                        SessionState::WaitingForInput => "input",
-                        SessionState::Error => "error",
-                        _ => "attention",
-                    };
-                    if self.bell_notifier.should_bell(&key, &prev, &state) {
-                        self.bell_notifier.fire_bell(&info, reason);
-                        let _ = self.broadcast_tx.send(DaemonMessage::Bell {
-                            session_id: info.id.clone(),
-                            host: info.host.clone(),
-                            reason: reason.to_string(),
-                        });
-                    }
-                }
-
-                self.session_runtime.insert(
-                    key.clone(),
-                    SessionRuntime {
-                        last_state: state.clone(),
-                        oc_base_url: base_url.clone(),
-                    },
-                );
-
-                if self
-                    .sessions
-                    .get(&key)
-                    .map(|s| s.state != state)
-                    .unwrap_or(true)
-                {
-                    let _ = self.broadcast_tx.send(DaemonMessage::SessionUpdated {
-                        session: info.clone(),
+                if self.bell_notifier.should_bell(&key, &prev, &state) {
+                    self.bell_notifier.fire_bell(&info, reason);
+                    let _ = self.broadcast_tx.send(DaemonMessage::Bell {
+                        session_id: info.id.clone(),
+                        host: info.host.clone(),
+                        reason: reason.to_string(),
                     });
                 }
-
-                self.sessions.insert(key, info);
-                session_count += 1;
             }
+
+            self.session_runtime.insert(
+                key.clone(),
+                SessionRuntime {
+                    last_state: state.clone(),
+                    oc_base_url: base_url,
+                },
+            );
+
+            if self
+                .sessions
+                .get(&key)
+                .map(|s| s.state != state)
+                .unwrap_or(true)
+            {
+                let _ = self.broadcast_tx.send(DaemonMessage::SessionUpdated {
+                    session: info.clone(),
+                });
+            }
+
+            self.sessions.insert(key, info);
         }
 
         self.cleanup_stale_sessions(host, &seen_keys);
@@ -277,7 +265,7 @@ impl DaemonCore {
             HostStatus {
                 name: host.to_string(),
                 connected,
-                session_count,
+                session_count: scan.active_sessions.len(),
                 last_poll_unix_ms: Some(now_ms),
                 error,
             },
@@ -351,16 +339,18 @@ impl DaemonCore {
                 let _ = ipc::send_message(&mut write_half, &snapshot).await;
 
                 let mut rx = self.broadcast_tx.subscribe();
-                loop {
-                    match rx.recv().await {
-                        Ok(msg) => {
-                            if ipc::send_message(&mut write_half, &msg).await.is_err() {
-                                break;
+                tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(msg) => {
+                                if ipc::send_message(&mut write_half, &msg).await.is_err() {
+                                    break;
+                                }
                             }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
-                }
+                });
             }
             ClientMessage::InjectEvent { session_id, state } => {
                 let new_state = SessionState::from_oc_str(&state);

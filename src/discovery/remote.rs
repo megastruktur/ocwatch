@@ -1,47 +1,41 @@
-//! Remote host scanner for OpenCode processes.
-//!
-//! IMPORTANT: tmux is NOT available on the remote megaserver.
-//! Discovery uses: ps aux + lsof (NOT tmux list-panes).
-//! SSH port-forwarding is set up for each discovered OC instance.
-
 use anyhow::Result;
-use crate::discovery::{DiscoveredInstance, discover_port_from_lsof, discover_port_from_proc_net_tcp};
+use crate::discovery::{ActiveSession, DiscoveredInstance, ScanResult, discover_port_from_lsof, discover_port_from_proc_net_tcp};
 use crate::ssh::SshManager;
 use std::collections::HashSet;
 
-/// Represents a raw process entry from `ps aux` on remote
 #[derive(Debug)]
 struct RemoteProcess {
     pid: u32,
     cmdline: String,
 }
 
-/// Scan a remote host for OpenCode processes.
-/// Uses ps aux + lsof over SSH (NOT tmux, which isn't available on all hosts).
-/// Sets up SSH port forwards for each discovered OC instance.
-/// Returns discovered instances with LOCAL forwarded ports.
-pub async fn scan_remote(
+/// Scan a remote host for active OpenCode sessions using the new TUI-based detection.
+/// Finds TUI processes → CWD → git project_id → sqlite3 query.
+/// Also discovers server process port and sets up SSH port forward.
+pub async fn scan_remote_v2(
     ssh_manager: &mut SshManager,
     host_name: &str,
-) -> Vec<DiscoveredInstance> {
-    match try_scan_remote(ssh_manager, host_name).await {
-        Ok(instances) => instances,
+) -> ScanResult {
+    match try_scan_remote_v2(ssh_manager, host_name).await {
+        Ok(result) => result,
         Err(e) => {
             tracing::warn!("Remote scan failed for {}: {}", host_name, e);
-            vec![]
+            ScanResult {
+                server_port: None,
+                server_remote_port: None,
+                active_sessions: vec![],
+            }
         }
     }
 }
 
-async fn try_scan_remote(
+async fn try_scan_remote_v2(
     ssh_manager: &mut SshManager,
     host_name: &str,
-) -> Result<Vec<DiscoveredInstance>> {
+) -> Result<ScanResult> {
     let previous_remote_ports = ssh_manager.forwarded_remote_ports(host_name);
 
-    // Find OpenCode processes on remote using ps aux
     let ps_output = ssh_manager.exec(host_name, "ps aux").await?;
-
     let oc_processes: Vec<RemoteProcess> = ps_output
         .lines()
         .filter(|line| {
@@ -54,65 +48,114 @@ async fn try_scan_remote(
 
     tracing::debug!("Found {} opencode processes on {}", oc_processes.len(), host_name);
 
-    let mut instances = Vec::new();
+    let mut server_port: Option<u16> = None;
+    let mut server_remote_port: Option<u16> = None;
+    let mut tui_pids: Vec<u32> = Vec::new();
     let mut current_remote_ports = HashSet::new();
 
-    for proc in oc_processes {
-        // Try to discover port via lsof
+    for proc in &oc_processes {
         let lsof_cmd = format!("lsof -p {} -i -P -n 2>/dev/null || true", proc.pid);
         let lsof_output = ssh_manager.exec(host_name, &lsof_cmd).await.unwrap_or_default();
 
-        let remote_port = if let Some(port) = discover_port_from_lsof(&lsof_output) {
-            port
-        } else if let Some(port) = extract_port_from_cmdline(&proc.cmdline) {
-            port
+        let remote_port = discover_port_from_lsof(&lsof_output)
+            .or_else(|| extract_port_from_cmdline(&proc.cmdline))
+            .or_else(|| {
+                // /proc/net/tcp fallback handled below
+                None
+            });
+
+        if let Some(rport) = remote_port {
+            current_remote_ports.insert(rport);
+            match ssh_manager.forward_port(host_name, rport).await {
+                Ok(local_port) => {
+                    server_port = Some(local_port);
+                    server_remote_port = Some(rport);
+                    tracing::info!(
+                        "Remote OC server on {}: PID={} remote_port={} → local_port={}",
+                        host_name, proc.pid, rport, local_port
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to forward port {} for {}: {}", rport, host_name, e);
+                }
+            }
         } else {
-            // Fallback: /proc/net/tcp (Linux only)
+            // No LISTEN port → TUI process
+            // Try /proc/net/tcp before classifying as TUI
             let proc_tcp = ssh_manager
-                .exec(
-                    host_name,
-                    &format!(
-                        "cat /proc/{}/net/tcp 2>/dev/null || cat /proc/net/tcp 2>/dev/null || true",
-                        proc.pid
-                    ),
-                )
+                .exec(host_name, &format!(
+                    "cat /proc/{}/net/tcp 2>/dev/null || cat /proc/net/tcp 2>/dev/null || true",
+                    proc.pid
+                ))
                 .await
                 .unwrap_or_default();
 
             if let Some(port) = discover_port_from_proc_net_tcp(&proc_tcp, proc.pid) {
-                port
+                current_remote_ports.insert(port);
+                match ssh_manager.forward_port(host_name, port).await {
+                    Ok(local_port) => {
+                        server_port = Some(local_port);
+                        server_remote_port = Some(port);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to forward port {} for {}: {}", port, host_name, e);
+                    }
+                }
             } else {
-                tracing::warn!(
-                    "Could not discover port for remote OC PID {}, skipping",
-                    proc.pid
-                );
-                continue;
+                tui_pids.push(proc.pid);
             }
-        };
+        }
+    }
 
-        current_remote_ports.insert(remote_port);
+    let mut active_sessions = Vec::new();
 
-        // Set up SSH port forward: local_port → remote_host:remote_port
-        let local_port = match ssh_manager.forward_port(host_name, remote_port).await {
-            Ok(port) => port,
-            Err(e) => {
-                tracing::warn!("Failed to forward port {} for remote OC: {}", remote_port, e);
-                continue;
-            }
-        };
-
-        tracing::info!(
-            "Remote OC on {}: PID={} remote_port={} → local_port={}",
-            host_name,
-            proc.pid,
-            remote_port,
-            local_port
+    for pid in &tui_pids {
+        let cwd_cmd = format!(
+            "readlink /proc/{}/cwd 2>/dev/null || lsof -a -p {} -d cwd -F n 2>/dev/null | grep '^n' | sed 's/^n//'",
+            pid, pid
         );
+        let cwd = ssh_manager.exec(host_name, &cwd_cmd).await.unwrap_or_default();
+        let cwd = cwd.trim().to_string();
+        if cwd.is_empty() || !cwd.starts_with('/') {
+            continue;
+        }
 
-        instances.push(DiscoveredInstance {
-            pid: proc.pid,
-            port: local_port,
-            remote_port: Some(remote_port),
+        let git_cmd = format!(
+            "git -C '{}' rev-list --max-parents=0 HEAD 2>/dev/null | sort | head -1",
+            cwd.replace('\'', "'\\''")
+        );
+        let project_id = ssh_manager.exec(host_name, &git_cmd).await.unwrap_or_default();
+        let project_id = project_id.trim().to_string();
+        if project_id.is_empty() {
+            continue;
+        }
+
+        let db_query = format!(
+            "sqlite3 -separator '|' ~/.local/share/opencode/opencode.db \
+             \"SELECT id, title, directory, time_updated \
+              FROM session \
+              WHERE project_id = '{}' AND parent_id IS NULL \
+              ORDER BY time_updated DESC LIMIT 1\"",
+            project_id.replace('\'', "''")
+        );
+        let db_output = ssh_manager.exec(host_name, &db_query).await.unwrap_or_default();
+        let db_output = db_output.trim();
+        if db_output.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = db_output.splitn(4, '|').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+
+        active_sessions.push(ActiveSession {
+            session_id: parts[0].to_string(),
+            title: parts[1].to_string(),
+            directory: parts[2].to_string(),
+            project_id: project_id.clone(),
+            time_updated_ms: parts[3].parse().unwrap_or(0),
+            tui_pid: *pid,
             tmux_session: None,
             tmux_window: None,
             tmux_window_index: None,
@@ -124,29 +167,26 @@ async fn try_scan_remote(
     let current_ports: Vec<u16> = current_remote_ports.into_iter().collect();
     reconcile_port_forwards(ssh_manager, host_name, &current_ports, &previous_remote_ports).await;
 
-    Ok(instances)
+    Ok(ScanResult {
+        server_port,
+        server_remote_port,
+        active_sessions,
+    })
 }
 
-/// Parse a `ps aux` output line to extract PID and cmdline.
-/// Format: USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
 fn parse_ps_line(line: &str) -> Option<RemoteProcess> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-
     if parts.first() == Some(&"USER") {
         return None;
     }
-
     if parts.len() < 11 {
         return None;
     }
-
     let pid: u32 = parts.get(1)?.parse().ok()?;
     let cmdline = parts[10..].join(" ");
-
     Some(RemoteProcess { pid, cmdline })
 }
 
-/// Extract --port N or --port=N from a command line string.
 fn extract_port_from_cmdline(cmdline: &str) -> Option<u16> {
     let parts: Vec<&str> = cmdline.split_whitespace().collect();
     for (i, part) in parts.iter().enumerate() {
@@ -160,9 +200,6 @@ fn extract_port_from_cmdline(cmdline: &str) -> Option<u16> {
     None
 }
 
-/// Reconcile port forwards: unforward ports for instances that no longer exist.
-/// `current`: newly discovered instance ports
-/// `previous_ports`: remote ports that were previously forwarded
 pub async fn reconcile_port_forwards(
     ssh_manager: &mut SshManager,
     host_name: &str,
@@ -175,4 +212,29 @@ pub async fn reconcile_port_forwards(
             ssh_manager.unforward_port(host_name, old_port).await;
         }
     }
+}
+
+// ─── Legacy API (kept for debug commands) ─────────────────────────────────────
+
+pub async fn scan_remote(
+    ssh_manager: &mut SshManager,
+    host_name: &str,
+) -> Vec<DiscoveredInstance> {
+    let result = scan_remote_v2(ssh_manager, host_name).await;
+    let mut instances = Vec::new();
+
+    for s in result.active_sessions {
+        instances.push(DiscoveredInstance {
+            pid: s.tui_pid,
+            port: result.server_port.unwrap_or(0),
+            remote_port: result.server_remote_port,
+            tmux_session: s.tmux_session,
+            tmux_window: s.tmux_window,
+            tmux_window_index: s.tmux_window_index,
+            tmux_pane_index: s.tmux_pane_index,
+            tmux_pane_tty: s.tmux_pane_tty,
+        });
+    }
+
+    instances
 }

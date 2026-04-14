@@ -47,6 +47,14 @@ impl SshManager {
         let control_path = Self::control_path(&host.name);
 
         if self.is_connected_internal(host, &control_path).await {
+            // Existing ControlMaster from a previous process — register it so exec() works.
+            self.connections
+                .entry(host.name.clone())
+                .or_insert_with(|| SshConnection {
+                    host_config: host.clone(),
+                    control_path: control_path.clone(),
+                    forwarded_ports: HashMap::new(),
+                });
             return Ok(());
         }
 

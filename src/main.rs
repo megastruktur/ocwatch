@@ -58,6 +58,8 @@ enum DaemonCommands {
 enum DebugCommands {
     /// Scan local tmux panes for OpenCode processes
     ScanLocal,
+    /// Scan local using new TUI-based active session detection
+    ScanLocalV2,
     /// Scan a remote host for OpenCode processes
     ScanRemote {
         /// Host name from config
@@ -106,6 +108,7 @@ async fn main() -> Result<()> {
         Some(Commands::Approve { session_id }) => run_approve(&session_id).await,
         Some(Commands::Debug { action }) => match action {
             DebugCommands::ScanLocal => debug_scan_local().await,
+            DebugCommands::ScanLocalV2 => debug_scan_local_v2().await,
             DebugCommands::ScanRemote { host } => debug_scan_remote(&host).await,
             DebugCommands::SshCheck { host } => debug_ssh_check(&host).await,
             DebugCommands::OcClient { url } => debug_oc_client(&url).await,
@@ -162,6 +165,12 @@ async fn run_approve(session_id: &str) -> Result<()> {
 async fn debug_scan_local() -> Result<()> {
     let instances = discovery::local::scan_local_tmux().await;
     println!("{}", serde_json::to_string_pretty(&instances)?);
+    Ok(())
+}
+
+async fn debug_scan_local_v2() -> Result<()> {
+    let result = discovery::local::scan_local().await;
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 
