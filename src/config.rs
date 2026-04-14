@@ -18,12 +18,9 @@ fn default_poll_interval() -> u16 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HostConfig {
     pub name: String,
-    /// None = local machine. Some("megaserver") = SSH target
     pub ssh_target: Option<String>,
     pub ssh_identity: Option<PathBuf>,
     pub ssh_port: Option<u16>,
-    /// If set, only scan this tmux session name on remote
-    pub tmux_session_filter: Option<String>,
 }
 
 impl Default for Config {
