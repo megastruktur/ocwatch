@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
 use tokio::process::Command;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{mpsc::{self, UnboundedReceiver, UnboundedSender}, oneshot};
 
 use crate::config::Config;
 use crate::daemon::bell::BellNotifier;
@@ -57,6 +57,9 @@ pub struct DaemonCore {
     hosts: HashMap<String, HostStatus>,
     scan_in_progress: bool,
     rescan_requested: bool,
+    active_scan_generation: u64,
+    completed_scan_generation: u64,
+    pending_refresh_responders: Vec<(u64, oneshot::Sender<DaemonMessage>)>,
     broadcast_tx: BroadcastTx,
     started_at: Instant,
     bell_notifier: BellNotifier,
@@ -77,6 +80,9 @@ impl DaemonCore {
             hosts: HashMap::new(),
             scan_in_progress: false,
             rescan_requested: false,
+            active_scan_generation: 0,
+            completed_scan_generation: 0,
+            pending_refresh_responders: Vec::new(),
             broadcast_tx,
             started_at: Instant::now(),
             bell_notifier: BellNotifier::new(),
@@ -98,12 +104,7 @@ impl DaemonCore {
             .context("Failed to set socket permissions")?;
 
         self.ensure_host_placeholders();
-        let (scan_cmd_tx, scan_cmd_rx) = mpsc::unbounded_channel();
-        let (scan_event_tx, mut scan_event_rx) = mpsc::unbounded_channel();
-        let config = self.config.clone();
-        let scan_worker = tokio::spawn(async move {
-            run_scan_worker(config, scan_cmd_rx, scan_event_tx).await;
-        });
+        let (mut scan_cmd_tx, mut scan_event_rx, mut scan_worker) = spawn_scan_worker(self.config.clone());
 
         let mut poll_interval = tokio::time::interval(Duration::from_secs(
             self.config.poll_interval_secs as u64,
@@ -143,15 +144,34 @@ impl DaemonCore {
                         }
                     }
                 }
-                Some(event) = scan_event_rx.recv() => {
+                event = scan_event_rx.recv() => {
                     match event {
-                        ScanWorkerEvent::HostScanned(scan) => {
+                        Some(ScanWorkerEvent::HostScanned(scan)) => {
                             self.apply_scan_result(scan);
                             self.broadcast_snapshot();
                         }
-                        ScanWorkerEvent::CycleComplete => {
+                        Some(ScanWorkerEvent::CycleComplete) => {
                             self.scan_in_progress = false;
+                            self.completed_scan_generation = self.active_scan_generation;
+                            self.flush_refresh_responders();
+
                             if self.rescan_requested {
+                                self.rescan_requested = false;
+                                self.request_scan_cycle(&scan_cmd_tx);
+                            }
+                        }
+                        None => {
+                            tracing::error!("Scan worker stopped unexpectedly; restarting");
+                            let should_resume_scan = self.scan_in_progress
+                                || self.rescan_requested
+                                || !self.pending_refresh_responders.is_empty();
+                            self.scan_in_progress = false;
+                            let (new_tx, new_rx, new_worker) = spawn_scan_worker(self.config.clone());
+                            scan_cmd_tx = new_tx;
+                            scan_event_rx = new_rx;
+                            scan_worker = new_worker;
+
+                            if should_resume_scan {
                                 self.rescan_requested = false;
                                 self.request_scan_cycle(&scan_cmd_tx);
                             }
@@ -180,11 +200,29 @@ impl DaemonCore {
         }
 
         self.scan_in_progress = true;
+        self.active_scan_generation += 1;
 
         if scan_cmd_tx.send(ScanWorkerCommand::StartCycle).is_err() {
             self.scan_in_progress = false;
             tracing::error!("Failed to schedule scan cycle: scan worker channel closed");
         }
+    }
+
+    fn schedule_refresh(
+        &mut self,
+        scan_cmd_tx: &UnboundedSender<ScanWorkerCommand>,
+        responder: oneshot::Sender<DaemonMessage>,
+    ) {
+        let target_generation = if self.scan_in_progress {
+            self.rescan_requested = true;
+            self.active_scan_generation + 1
+        } else {
+            self.request_scan_cycle(scan_cmd_tx);
+            self.active_scan_generation
+        };
+
+        self.pending_refresh_responders
+            .push((target_generation, responder));
     }
 
     fn ensure_host_placeholders(&mut self) {
@@ -289,6 +327,21 @@ impl DaemonCore {
             .retain(|key, _| !key.starts_with(&prefix) || seen_keys.contains(key));
         self.session_runtime
             .retain(|key, _| !key.starts_with(&prefix) || seen_keys.contains(key));
+    }
+
+    fn flush_refresh_responders(&mut self) {
+        let snapshot = self.state_snapshot();
+        let mut remaining = Vec::new();
+
+        for (generation, responder) in self.pending_refresh_responders.drain(..) {
+            if generation <= self.completed_scan_generation {
+                let _ = responder.send(snapshot.clone());
+            } else {
+                remaining.push((generation, responder));
+            }
+        }
+
+        self.pending_refresh_responders = remaining;
     }
 
 
@@ -696,8 +749,13 @@ impl DaemonCore {
                 }
             }
             ClientMessage::RefreshAll => {
-                self.request_scan_cycle(scan_cmd_tx);
-                let _ = ipc::send_message(&mut write_half, &self.state_snapshot()).await;
+                let (refresh_tx, refresh_rx) = oneshot::channel();
+                self.schedule_refresh(scan_cmd_tx, refresh_tx);
+                tokio::spawn(async move {
+                    if let Ok(snapshot) = refresh_rx.await {
+                        let _ = ipc::send_message(&mut write_half, &snapshot).await;
+                    }
+                });
             }
             ClientMessage::GetRecentDirs { limit } => {
                 let missing_hosts = self.has_missing_recent_dir_hosts();
@@ -790,6 +848,22 @@ async fn run_scan_worker(
     }
 
     ssh_manager.disconnect_all().await;
+}
+
+fn spawn_scan_worker(
+    config: Config,
+) -> (
+    UnboundedSender<ScanWorkerCommand>,
+    UnboundedReceiver<ScanWorkerEvent>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (scan_cmd_tx, scan_cmd_rx) = mpsc::unbounded_channel();
+    let (scan_event_tx, scan_event_rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        run_scan_worker(config, scan_cmd_rx, scan_event_tx).await;
+    });
+
+    (scan_cmd_tx, scan_event_rx, handle)
 }
 
 async fn scan_local_host() -> ResolvedHostScan {

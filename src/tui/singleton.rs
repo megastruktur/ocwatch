@@ -227,15 +227,16 @@ fn is_same_tui_process(record: &TuiInstanceRecord) -> bool {
     };
 
     let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let executable = command.split_whitespace().next().unwrap_or_default();
     let exe_path = Path::new(&record.exe_path);
     let exe_name = exe_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
 
-    command == record.exe_path
-        || command == exe_name
-        || command.ends_with(&format!("/{}", exe_name))
+    executable == record.exe_path
+        || executable == exe_name
+        || executable.ends_with(&format!("/{}", exe_name))
 }
 
 async fn terminate_process(pid: u32) -> Result<()> {
