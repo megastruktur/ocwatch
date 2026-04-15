@@ -2,6 +2,8 @@
 
 Terminal monitor for OpenCode AI coding sessions — local and remote.
 
+![ocwatch TUI](screenshots/app.png)
+
 ## Overview
 
 ocwatch is a daemon + TUI application written in Rust that auto-discovers OpenCode sessions running locally (in tmux panes) and on remote hosts (via SSH), displays them in a live split-panel terminal interface, and notifies via tmux bell when a session needs attention. The daemon runs in the background, polling all configured hosts on a configurable interval. A TUI client connects to the daemon via a Unix socket and renders live session state, allowing you to approve permissions or drop into a session with a single keystroke.
