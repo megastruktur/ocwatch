@@ -157,14 +157,14 @@ impl DaemonCore {
 
                             if self.rescan_requested {
                                 self.rescan_requested = false;
-                                let _ = self.request_scan_cycle(&scan_cmd_tx);
+                                if !self.request_scan_cycle(&scan_cmd_tx) {
+                                    self.fail_refresh_responders("Failed to restart the next scan cycle");
+                                }
                             }
                         }
                         None => {
                             tracing::error!("Scan worker stopped unexpectedly; restarting");
-                            let should_resume_scan = self.scan_in_progress
-                                || self.rescan_requested
-                                || !self.pending_refresh_responders.is_empty();
+                            let should_resume_scan = self.scan_in_progress || self.rescan_requested;
                             self.fail_refresh_responders("Refresh aborted because the scan worker stopped");
                             self.scan_in_progress = false;
                             let (new_tx, new_rx, new_worker) = spawn_scan_worker(self.config.clone());
