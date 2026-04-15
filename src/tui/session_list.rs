@@ -18,13 +18,22 @@ struct SessionRow {
     is_expanded: bool,
 }
 
+struct CwdGroup {
+    label: String,
+    session_rows: Vec<SessionRow>,
+}
+
 pub fn ordered_session_indices(
     sessions: &[SessionInfo],
     expanded_session_keys: &HashSet<String>,
 ) -> Vec<usize> {
     grouped_session_rows_by_host(sessions, expanded_session_keys)
         .into_iter()
-        .flat_map(|(_, rows)| rows.into_iter().map(|row| row.session_index))
+        .flat_map(|(_, groups)| {
+            groups
+                .into_iter()
+                .flat_map(|group| group.session_rows.into_iter().map(|row| row.session_index))
+        })
         .collect()
 }
 
@@ -118,7 +127,7 @@ fn build_session_items(app: &App, area_width: u16) -> (Vec<ListItem<'static>>, V
     let mut items = Vec::new();
     let mut visual_to_session: Vec<Option<usize>> = Vec::new();
 
-    for (host, session_rows) in by_host {
+    for (host, cwd_groups) in by_host {
         let total_host_sessions = app
             .sessions
             .iter()
@@ -133,31 +142,46 @@ fn build_session_items(app: &App, area_width: u16) -> (Vec<ListItem<'static>>, V
         items.push(ListItem::new(header));
         visual_to_session.push(None);
 
-        for row in session_rows {
-            let session = &app.sessions[row.session_index];
-            let (icon, color) = state_icon_color(&session.state);
-            let attention_marker = if app.session_has_attention(session) {
-                Span::styled("⚠ ", Style::default().fg(Color::Yellow))
-            } else {
-                Span::raw("  ")
-            };
-            let prefix = session_row_prefix(row.depth, row.has_children, row.is_expanded);
-            let title = truncate(
-                &session.title,
-                title_width.saturating_sub(prefix.chars().count()),
-            );
-            let line = Line::from(vec![
+        for cwd_group in cwd_groups {
+            let cwd_header = Line::from(vec![
+                Span::raw("  "),
                 Span::styled(
-                    prefix,
-                    session_row_prefix_style(row.depth, row.has_children),
+                    format!("▾ {}", cwd_group.label),
+                    Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled(icon.to_string(), Style::default().fg(color)),
-                Span::raw(" "),
-                attention_marker,
-                Span::raw(title),
             ]);
-            items.push(ListItem::new(line));
-            visual_to_session.push(Some(row.session_index));
+            items.push(ListItem::new(cwd_header));
+            visual_to_session.push(None);
+
+            for row in cwd_group.session_rows {
+                let session = &app.sessions[row.session_index];
+                let (icon, color) = state_icon_color(&session.state);
+                let attention_marker = if app.session_has_attention(session) {
+                    Span::styled("⚠ ", Style::default().fg(Color::Yellow))
+                } else {
+                    Span::raw("  ")
+                };
+                let prefix = format!(
+                    "  {}",
+                    session_row_prefix(row.depth, row.has_children, row.is_expanded)
+                );
+                let title = truncate(
+                    &session.title,
+                    title_width.saturating_sub(prefix.chars().count()),
+                );
+                let line = Line::from(vec![
+                    Span::styled(
+                        prefix,
+                        session_row_prefix_style(row.depth, row.has_children),
+                    ),
+                    Span::styled(icon.to_string(), Style::default().fg(color)),
+                    Span::raw(" "),
+                    attention_marker,
+                    Span::raw(title),
+                ]);
+                items.push(ListItem::new(line));
+                visual_to_session.push(Some(row.session_index));
+            }
         }
     }
 
@@ -167,7 +191,7 @@ fn build_session_items(app: &App, area_width: u16) -> (Vec<ListItem<'static>>, V
 fn grouped_session_rows_by_host(
     sessions: &[SessionInfo],
     expanded_session_keys: &HashSet<String>,
-) -> Vec<(String, Vec<SessionRow>)> {
+) -> Vec<(String, Vec<CwdGroup>)> {
     let mut by_host: Vec<(String, Vec<usize>)> = Vec::new();
 
     for (idx, session) in sessions.iter().enumerate() {
@@ -183,10 +207,70 @@ fn grouped_session_rows_by_host(
         .map(|(host, indices)| {
             (
                 host,
-                build_host_session_rows(sessions, &indices, expanded_session_keys),
+                build_host_cwd_groups(sessions, &indices, expanded_session_keys),
             )
         })
         .collect()
+}
+
+fn build_host_cwd_groups(
+    sessions: &[SessionInfo],
+    session_indices: &[usize],
+    expanded_session_keys: &HashSet<String>,
+) -> Vec<CwdGroup> {
+    let mut by_cwd: Vec<(String, Vec<usize>)> = Vec::new();
+    let group_labels = unique_cwd_group_labels(
+        session_indices
+            .iter()
+            .map(|&index| sessions[index].working_dir.as_str()),
+    );
+    let host_rows = build_host_session_rows(sessions, session_indices, expanded_session_keys);
+    let mut group_positions: HashMap<String, usize> = HashMap::new();
+
+    for (position, row) in host_rows.iter().enumerate() {
+        let cwd = sessions[row.session_index].working_dir.clone();
+        group_positions.entry(cwd).or_insert(position);
+    }
+
+    for &index in session_indices {
+        let cwd = sessions[index].working_dir.clone();
+
+        if let Some((_, indices)) = by_cwd.iter_mut().find(|(group_cwd, _)| group_cwd == &cwd) {
+            indices.push(index);
+        } else {
+            by_cwd.push((cwd, vec![index]));
+        }
+    }
+
+    let mut groups = by_cwd
+        .into_iter()
+        .map(|(cwd, indices)| {
+            let label = group_labels
+                .get(&cwd)
+                .cloned()
+                .unwrap_or_else(|| directory_basename(&cwd).to_string());
+            let rows = build_host_session_rows(sessions, &indices, expanded_session_keys);
+            let position = group_positions.get(&cwd).copied().unwrap_or(usize::MAX);
+
+            (
+                position,
+                CwdGroup {
+                    label,
+                    session_rows: rows,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    groups.sort_by(
+        |(left_position, left_group), (right_position, right_group)| {
+            left_position
+                .cmp(right_position)
+                .then_with(|| left_group.label.cmp(&right_group.label))
+        },
+    );
+
+    groups.into_iter().map(|(_, group)| group).collect()
 }
 
 fn build_host_session_rows(
@@ -337,6 +421,65 @@ fn session_sort_key(session: &SessionInfo) -> (u64, &str, &str) {
         session.title.as_str(),
         session.id.as_str(),
     )
+}
+
+fn unique_cwd_group_labels<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+) -> HashMap<String, String> {
+    let unique_paths = paths
+        .into_iter()
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let segment_lists = unique_paths
+        .iter()
+        .map(|path| (path.clone(), path_segments(path)))
+        .collect::<Vec<_>>();
+    let max_depth = segment_lists
+        .iter()
+        .map(|(_, segments)| segments.len())
+        .max()
+        .unwrap_or(1);
+
+    for depth in 1..=max_depth {
+        let mut labels_by_path = HashMap::new();
+        let mut counts = HashMap::new();
+
+        for (path, segments) in &segment_lists {
+            let label = path_suffix_label(segments, depth);
+            *counts.entry(label.clone()).or_insert(0usize) += 1;
+            labels_by_path.insert(path.clone(), label);
+        }
+
+        if counts.values().all(|count| *count == 1) {
+            return labels_by_path;
+        }
+    }
+
+    unique_paths
+        .into_iter()
+        .map(|path| (path.clone(), path))
+        .collect()
+}
+
+fn directory_basename(path: &str) -> &str {
+    path.rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path)
+}
+
+fn path_segments(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn path_suffix_label(segments: &[&str], depth: usize) -> String {
+    if segments.is_empty() {
+        return "/".to_string();
+    }
+
+    let start = segments.len().saturating_sub(depth);
+    segments[start..].join("/")
 }
 
 fn state_icon_color(state: &SessionState) -> (&'static str, Color) {
