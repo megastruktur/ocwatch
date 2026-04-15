@@ -146,7 +146,7 @@ fn build_session_items(app: &App, area_width: u16) -> (Vec<ListItem<'static>>, V
             let cwd_header = Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
-                    format!("▾ {}", cwd_group.label),
+                    format!("· {}", cwd_group.label),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]);
@@ -218,59 +218,40 @@ fn build_host_cwd_groups(
     session_indices: &[usize],
     expanded_session_keys: &HashSet<String>,
 ) -> Vec<CwdGroup> {
-    let mut by_cwd: Vec<(String, Vec<usize>)> = Vec::new();
     let group_labels = unique_cwd_group_labels(
         session_indices
             .iter()
             .map(|&index| sessions[index].working_dir.as_str()),
     );
     let host_rows = build_host_session_rows(sessions, session_indices, expanded_session_keys);
-    let mut group_positions: HashMap<String, usize> = HashMap::new();
+    let mut cwd_order = Vec::new();
+    let mut groups_by_cwd: HashMap<String, CwdGroup> = HashMap::new();
 
-    for (position, row) in host_rows.iter().enumerate() {
+    for row in host_rows {
         let cwd = sessions[row.session_index].working_dir.clone();
-        group_positions.entry(cwd).or_insert(position);
-    }
+        if !groups_by_cwd.contains_key(&cwd) {
+            cwd_order.push(cwd.clone());
+            groups_by_cwd.insert(
+                cwd.clone(),
+                CwdGroup {
+                    label: group_labels
+                        .get(&cwd)
+                        .cloned()
+                        .unwrap_or_else(|| directory_basename(&cwd).to_string()),
+                    session_rows: Vec::new(),
+                },
+            );
+        }
 
-    for &index in session_indices {
-        let cwd = sessions[index].working_dir.clone();
-
-        if let Some((_, indices)) = by_cwd.iter_mut().find(|(group_cwd, _)| group_cwd == &cwd) {
-            indices.push(index);
-        } else {
-            by_cwd.push((cwd, vec![index]));
+        if let Some(group) = groups_by_cwd.get_mut(&cwd) {
+            group.session_rows.push(row);
         }
     }
 
-    let mut groups = by_cwd
+    cwd_order
         .into_iter()
-        .map(|(cwd, indices)| {
-            let label = group_labels
-                .get(&cwd)
-                .cloned()
-                .unwrap_or_else(|| directory_basename(&cwd).to_string());
-            let rows = build_host_session_rows(sessions, &indices, expanded_session_keys);
-            let position = group_positions.get(&cwd).copied().unwrap_or(usize::MAX);
-
-            (
-                position,
-                CwdGroup {
-                    label,
-                    session_rows: rows,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-
-    groups.sort_by(
-        |(left_position, left_group), (right_position, right_group)| {
-            left_position
-                .cmp(right_position)
-                .then_with(|| left_group.label.cmp(&right_group.label))
-        },
-    );
-
-    groups.into_iter().map(|(_, group)| group).collect()
+        .filter_map(|cwd| groups_by_cwd.remove(&cwd))
+        .collect()
 }
 
 fn build_host_session_rows(
