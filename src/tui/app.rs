@@ -376,6 +376,15 @@ async fn run_app(
         }
     });
 
+    if let Ok(Some(initial_msg)) = tokio::time::timeout(Duration::from_millis(50), msg_rx.recv()).await
+    {
+        handle_daemon_message(&mut app, initial_msg);
+
+        while let Ok(msg) = msg_rx.try_recv() {
+            handle_daemon_message(&mut app, msg);
+        }
+    }
+
     let tick_rate = Duration::from_millis(200);
     let mut last_tick = Instant::now();
 

@@ -6,7 +6,7 @@ pub fn execute_attach(attach: AttachSpec) -> Option<String> {
             session,
             window,
             pane,
-        } => execute_local_tmux_attach(&session, window.as_deref(), pane.as_deref()),
+        } => execute_tmux_attach(None, &session, window.as_deref(), pane.as_deref()),
         AttachSpec::Exec {
             program,
             args,
@@ -15,36 +15,103 @@ pub fn execute_attach(attach: AttachSpec) -> Option<String> {
     }
 }
 
-fn execute_local_tmux_attach(
+pub fn execute_tmux_attach(
+    socket_path: Option<&str>,
     session: &str,
     window: Option<&str>,
     pane: Option<&str>,
 ) -> Option<String> {
     if std::env::var_os("TMUX").is_some() {
-        let target = match (window, pane) {
-            (Some(window), Some(pane)) => format!("{}:{}.{}", session, window, pane),
-            _ => session.to_string(),
-        };
-
-        let result = std::process::Command::new("tmux")
-            .args(["switch-client", "-t", &target])
+        let result = tmux_command(socket_path)
+            .args(["switch-client", "-t", &tmux_target(session, window, pane)])
             .status();
         if result.map(|status| status.success()).unwrap_or(false) {
             return None;
         }
 
-        return Some(format!("tmux switch-client failed for {}", target));
+        return Some(format!(
+            "tmux switch-client failed for {}",
+            tmux_target(session, window, pane)
+        ));
     }
 
-    let result = std::process::Command::new("tmux")
-        .args(["attach-session", "-t", session])
+    if let Some(window) = window {
+        let result = tmux_command(socket_path)
+            .args(["select-window", "-t", &window_target(session, window)])
+            .status();
+
+        if !result.map(|status| status.success()).unwrap_or(false) {
+            return Some(format!(
+                "tmux select-window failed for {}",
+                window_target(session, window)
+            ));
+        }
+    }
+
+    if let Some(pane) = pane {
+        let result = tmux_command(socket_path)
+            .args(["select-pane", "-t", &pane_target(session, window, pane)])
+            .status();
+
+        if !result.map(|status| status.success()).unwrap_or(false) {
+            return Some(format!(
+                "tmux select-pane failed for {}",
+                pane_target(session, window, pane)
+            ));
+        }
+    }
+
+    let result = tmux_command(socket_path)
+        .args(tmux_focus_args("attach-session", session))
         .status();
 
     if result.map(|status| status.success()).unwrap_or(false) {
         None
     } else {
-        Some(format!("tmux attach-session failed for {}", session))
+        Some(format!(
+            "tmux attach-session failed for {}",
+            tmux_target(session, window, pane)
+        ))
     }
+}
+
+fn tmux_focus_args(command: &str, session: &str) -> Vec<String> {
+    vec![command.to_string(), "-t".to_string(), session.to_string()]
+}
+
+fn tmux_target(session: &str, window: Option<&str>, pane: Option<&str>) -> String {
+    match (window, pane) {
+        (Some(window), Some(pane)) => format!("{}:{}.{}", session, window, pane),
+        (Some(window), None) => format!("{}:{}", session, window),
+        _ => session.to_string(),
+    }
+}
+
+fn window_target(session: &str, window: &str) -> String {
+    if window.starts_with('@') {
+        window.to_string()
+    } else {
+        format!("{}:{}", session, window)
+    }
+}
+
+fn pane_target(session: &str, window: Option<&str>, pane: &str) -> String {
+    if pane.starts_with('%') {
+        return pane.to_string();
+    }
+
+    match window {
+        Some(window) => format!("{}:{}.{}", session, window, pane),
+        None => format!("{}:.{}", session, pane),
+    }
+}
+
+fn tmux_command(socket_path: Option<&str>) -> std::process::Command {
+    let mut command = std::process::Command::new("tmux");
+    if let Some(socket_path) = socket_path {
+        command.args(["-S", socket_path]);
+    }
+    command
 }
 
 fn execute_exec_attach(

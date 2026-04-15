@@ -39,7 +39,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Unix utilities (PID, signals)
-nix = { version = "0.29", features = ["process", "signal"] }
+nix = { version = "0.29", features = ["fs", "process", "signal"] }
 
 # XDG directory paths
 dirs = "5"

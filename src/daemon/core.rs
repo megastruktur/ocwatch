@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
 use tokio::process::Command;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use crate::config::{Config, HostConfig};
+use crate::config::Config;
 use crate::daemon::bell::BellNotifier;
 use crate::daemon::recent_dirs::RecentDirStore;
 use crate::discovery::{local, remote, ActiveSession, ScanResult};
@@ -22,7 +23,30 @@ struct SessionRuntime {
 
 enum ScanTarget {
     Local,
-    Remote(HostConfig),
+    Remote(String),
+}
+
+enum ScanWorkerCommand {
+    StartCycle,
+}
+
+enum ScanWorkerEvent {
+    HostScanned(ResolvedHostScan),
+    CycleComplete,
+}
+
+struct ResolvedHostScan {
+    host: String,
+    connected: bool,
+    error: Option<String>,
+    completed_unix_ms: u64,
+    sessions: Vec<ResolvedSession>,
+}
+
+struct ResolvedSession {
+    info: SessionInfo,
+    oc_base_url: String,
+    last_seen_unix_ms: u64,
 }
 
 pub struct DaemonCore {
@@ -31,7 +55,7 @@ pub struct DaemonCore {
     sessions: HashMap<String, SessionInfo>,
     session_runtime: HashMap<String, SessionRuntime>,
     hosts: HashMap<String, HostStatus>,
-    pending_scan_targets: VecDeque<ScanTarget>,
+    scan_in_progress: bool,
     rescan_requested: bool,
     broadcast_tx: BroadcastTx,
     started_at: Instant,
@@ -51,7 +75,7 @@ impl DaemonCore {
             sessions: HashMap::new(),
             session_runtime: HashMap::new(),
             hosts: HashMap::new(),
-            pending_scan_targets: VecDeque::new(),
+            scan_in_progress: false,
             rescan_requested: false,
             broadcast_tx,
             started_at: Instant::now(),
@@ -74,12 +98,18 @@ impl DaemonCore {
             .context("Failed to set socket permissions")?;
 
         self.ensure_host_placeholders();
+        let (scan_cmd_tx, scan_cmd_rx) = mpsc::unbounded_channel();
+        let (scan_event_tx, mut scan_event_rx) = mpsc::unbounded_channel();
+        let config = self.config.clone();
+        let scan_worker = tokio::spawn(async move {
+            run_scan_worker(config, scan_cmd_rx, scan_event_tx).await;
+        });
 
         let mut poll_interval = tokio::time::interval(Duration::from_secs(
             self.config.poll_interval_secs as u64,
         ));
         poll_interval.tick().await;
-        self.enqueue_scan_cycle();
+        self.request_scan_cycle(&scan_cmd_tx);
 
         let mut sigterm = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
@@ -106,76 +136,54 @@ impl DaemonCore {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _)) => {
-                            self.handle_client(stream).await;
+                            self.handle_client(stream, &scan_cmd_tx).await;
                         }
                         Err(e) => {
                             tracing::error!("Accept error: {}", e);
                         }
                     }
                 }
-                _ = std::future::ready(()), if !self.pending_scan_targets.is_empty() => {
-                    if let Some(target) = self.pending_scan_targets.pop_front() {
-                        self.scan_target(target).await;
-                        self.broadcast_snapshot();
-                    }
-
-                    if self.pending_scan_targets.is_empty() {
-                        if self.rescan_requested {
-                            self.rescan_requested = false;
-                            self.enqueue_scan_cycle();
+                Some(event) = scan_event_rx.recv() => {
+                    match event {
+                        ScanWorkerEvent::HostScanned(scan) => {
+                            self.apply_scan_result(scan);
+                            self.broadcast_snapshot();
+                        }
+                        ScanWorkerEvent::CycleComplete => {
+                            self.scan_in_progress = false;
+                            if self.rescan_requested {
+                                self.rescan_requested = false;
+                                self.request_scan_cycle(&scan_cmd_tx);
+                            }
                         }
                     }
                 }
                 _ = poll_interval.tick() => {
-                    self.request_scan_cycle();
+                    self.request_scan_cycle(&scan_cmd_tx);
                 }
             }
         }
 
         self.ssh_manager.disconnect_all().await;
+        drop(scan_cmd_tx);
+        let _ = scan_worker.await;
         tracing::info!("Daemon core stopped");
         Ok(())
     }
 
-    fn enqueue_scan_cycle(&mut self) {
-        self.pending_scan_targets.push_back(ScanTarget::Local);
-        self.pending_scan_targets.extend(
-            self.config
-                .hosts
-                .iter()
-                .filter(|host| host.ssh_target.is_some())
-                .cloned()
-                .map(ScanTarget::Remote),
-        );
-    }
-
-    fn request_scan_cycle(&mut self) {
+    fn request_scan_cycle(&mut self, scan_cmd_tx: &UnboundedSender<ScanWorkerCommand>) {
         self.ensure_host_placeholders();
 
-        if self.pending_scan_targets.is_empty() {
-            self.enqueue_scan_cycle();
-        } else {
+        if self.scan_in_progress {
             self.rescan_requested = true;
+            return;
         }
-    }
 
-    async fn scan_all_hosts(&mut self) {
-        self.ensure_host_placeholders();
+        self.scan_in_progress = true;
 
-        let mut pending_scan_targets = VecDeque::new();
-        pending_scan_targets.push_back(ScanTarget::Local);
-        pending_scan_targets.extend(
-            self.config
-                .hosts
-                .iter()
-                .filter(|host| host.ssh_target.is_some())
-                .cloned()
-                .map(ScanTarget::Remote),
-        );
-
-        while let Some(target) = pending_scan_targets.pop_front() {
-            self.scan_target(target).await;
-            self.broadcast_snapshot();
+        if scan_cmd_tx.send(ScanWorkerCommand::StartCycle).is_err() {
+            self.scan_in_progress = false;
+            tracing::error!("Failed to schedule scan cycle: scan worker channel closed");
         }
     }
 
@@ -199,123 +207,20 @@ impl DaemonCore {
         }
     }
 
-    async fn scan_target(&mut self, target: ScanTarget) {
-        match target {
-            ScanTarget::Local => {
-                let local_scan = local::scan_local().await;
-                self.update_from_scan("local", &local_scan, true, None).await;
-            }
-            ScanTarget::Remote(host_config) => {
-                let host_name = host_config.name.clone();
-
-                if !self.ssh_manager.is_connected(&host_name).await {
-                    if let Err(error) = self.ssh_manager.connect(&host_config).await {
-                        tracing::warn!("SSH connect to {} failed: {}", host_name, error);
-                        self.mark_host_unreachable(&host_name, error.to_string());
-                        return;
-                    }
-                }
-
-                let scan = remote::scan_remote_v2(&mut self.ssh_manager, &host_name).await;
-                self.update_from_scan(&host_name, &scan, true, None).await;
-            }
-        }
-    }
-
-    fn mark_host_unreachable(&mut self, host_name: &str, error: String) {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        self.remove_host_sessions(host_name);
-        self.hosts.insert(
-            host_name.to_string(),
-            HostStatus {
-                name: host_name.to_string(),
-                connected: false,
-                session_count: 0,
-                last_poll_unix_ms: Some(now_ms),
-                error: Some(error),
-            },
-        );
-    }
-
     fn remove_host_sessions(&mut self, host_name: &str) {
         let prefix = format!("{}:", host_name);
         self.sessions.retain(|key, _| !key.starts_with(&prefix));
         self.session_runtime.retain(|key, _| !key.starts_with(&prefix));
     }
 
-    async fn update_from_scan(
-        &mut self,
-        host: &str,
-        scan: &ScanResult,
-        connected: bool,
-        error: Option<String>,
-    ) {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
+    fn apply_scan_result(&mut self, scan: ResolvedHostScan) {
         let mut seen_keys: HashSet<String> = HashSet::new();
 
-        let statuses = if let Some(port) = scan.server_port {
-            let base_url = format!("http://localhost:{}", port);
-            match OcClient::new(&base_url) {
-                Ok(client) => client.get_session_statuses().await.ok(),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-
-        for active in &scan.active_sessions {
-            self.record_recent_dir(host, &active.directory, active.time_updated_ms);
-            let inferred_state = active.inferred_state.clone();
-            let state = match &statuses {
-                Some(statuses) => {
-                    let api_state = statuses
-                        .get(&active.session_id)
-                        .and_then(|status| status.status.as_deref())
-                        .map(SessionState::from_oc_str);
-
-                    match api_state {
-                        Some(SessionState::Unknown) | None => {
-                            inferred_state.clone().unwrap_or(SessionState::Unknown)
-                        }
-                        Some(state) => state,
-                    }
-                }
-                None => inferred_state.unwrap_or(SessionState::Unknown),
-            };
-            let key = format!("{}:{}", host, active.session_id);
+        for resolved in scan.sessions {
+            self.record_recent_dir(&scan.host, &resolved.info.working_dir, resolved.last_seen_unix_ms);
+            let state = resolved.info.state.clone();
+            let key = format!("{}:{}", scan.host, resolved.info.id);
             seen_keys.insert(key.clone());
-
-            let oc_port = scan.server_port.unwrap_or(0);
-            let oc_base_url = format!("http://localhost:{}", oc_port);
-
-            let activity_age_secs = {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                now.saturating_sub(active.time_updated_ms) / 1000
-            };
-
-            let info = SessionInfo {
-                id: active.session_id.clone(),
-                host: host.to_string(),
-                state: state.clone(),
-                parent_id: active.parent_id.clone(),
-                title: active.title.clone(),
-                working_dir: active.directory.clone(),
-                activity_age_secs,
-                oc_port,
-                tmux_session: active.tmux_session.clone(),
-                tmux_window: active.tmux_window.clone(),
-                tmux_pane: active.tmux_pane_index.map(|i| i.to_string()),
-            };
 
             let prev_state = self
                 .session_runtime
@@ -331,10 +236,10 @@ impl DaemonCore {
                     _ => "attention",
                 };
                 if self.bell_notifier.should_bell(&key, &prev, &state) {
-                    self.bell_notifier.fire_bell(&info, reason);
+                    self.bell_notifier.fire_bell(&resolved.info, reason);
                     let _ = self.broadcast_tx.send(DaemonMessage::Bell {
-                        session_id: info.id.clone(),
-                        host: info.host.clone(),
+                        session_id: resolved.info.id.clone(),
+                        host: resolved.info.host.clone(),
                         reason: reason.to_string(),
                     });
                 }
@@ -344,7 +249,7 @@ impl DaemonCore {
                 key.clone(),
                 SessionRuntime {
                     last_state: state.clone(),
-                    oc_base_url,
+                    oc_base_url: resolved.oc_base_url.clone(),
                 },
             );
 
@@ -355,23 +260,23 @@ impl DaemonCore {
                 .unwrap_or(true)
             {
                 let _ = self.broadcast_tx.send(DaemonMessage::SessionUpdated {
-                    session: info.clone(),
+                    session: resolved.info.clone(),
                 });
             }
 
-            self.sessions.insert(key, info);
+            self.sessions.insert(key, resolved.info);
         }
 
-        self.cleanup_stale_sessions(host, &seen_keys);
+        self.cleanup_stale_sessions(&scan.host, &seen_keys);
 
         self.hosts.insert(
-            host.to_string(),
+            scan.host.to_string(),
             HostStatus {
-                name: host.to_string(),
-                connected,
-                session_count: scan.active_sessions.len(),
-                last_poll_unix_ms: Some(now_ms),
-                error,
+                name: scan.host,
+                connected: scan.connected,
+                session_count: seen_keys.len(),
+                last_poll_unix_ms: Some(scan.completed_unix_ms),
+                error: scan.error,
             },
         );
 
@@ -663,7 +568,11 @@ impl DaemonCore {
 
     /// Handle a single client connection (simplified: synchronous read-then-close).
     /// For v1: client sends a message, daemon responds, then client may stay subscribed.
-    async fn handle_client(&mut self, stream: tokio::net::UnixStream) {
+    async fn handle_client(
+        &mut self,
+        stream: tokio::net::UnixStream,
+        scan_cmd_tx: &UnboundedSender<ScanWorkerCommand>,
+    ) {
         use tokio::io::{BufReader};
 
         let (read_half, mut write_half) = stream.into_split();
@@ -787,9 +696,7 @@ impl DaemonCore {
                 }
             }
             ClientMessage::RefreshAll => {
-                self.pending_scan_targets.clear();
-                self.rescan_requested = false;
-                self.scan_all_hosts().await;
+                self.request_scan_cycle(scan_cmd_tx);
                 let _ = ipc::send_message(&mut write_half, &self.state_snapshot()).await;
             }
             ClientMessage::GetRecentDirs { limit } => {
@@ -839,6 +746,164 @@ impl DaemonCore {
                 let _ = kill(Pid::from_raw(std::process::id() as i32), Signal::SIGTERM);
             }
         }
+    }
+}
+
+async fn run_scan_worker(
+    config: Config,
+    mut command_rx: UnboundedReceiver<ScanWorkerCommand>,
+    event_tx: UnboundedSender<ScanWorkerEvent>,
+) {
+    let mut ssh_manager = SshManager::new();
+
+    while let Some(command) = command_rx.recv().await {
+        match command {
+            ScanWorkerCommand::StartCycle => {
+                if event_tx
+                    .send(ScanWorkerEvent::HostScanned(scan_local_host().await))
+                    .is_err()
+                {
+                    break;
+                }
+
+                for host_name in config
+                    .hosts
+                    .iter()
+                    .filter(|host| host.ssh_target.is_some())
+                    .map(|host| host.name.clone())
+                {
+                    if event_tx
+                        .send(ScanWorkerEvent::HostScanned(
+                            scan_remote_host(&config, &mut ssh_manager, &host_name).await,
+                        ))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+
+                if event_tx.send(ScanWorkerEvent::CycleComplete).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    ssh_manager.disconnect_all().await;
+}
+
+async fn scan_local_host() -> ResolvedHostScan {
+    let scan = local::scan_local().await;
+    resolve_host_scan("local", &scan, true, None).await
+}
+
+async fn scan_remote_host(
+    config: &Config,
+    ssh_manager: &mut SshManager,
+    host_name: &str,
+) -> ResolvedHostScan {
+    let Some(host_config) = config.hosts.iter().find(|host| host.name == host_name) else {
+        return ResolvedHostScan {
+            host: host_name.to_string(),
+            connected: false,
+            error: Some(format!("Host '{}' not found in config", host_name)),
+            completed_unix_ms: current_unix_ms(),
+            sessions: vec![],
+        };
+    };
+
+    if !ssh_manager.is_connected(host_name).await {
+        if let Err(error) = ssh_manager.connect(host_config).await {
+            tracing::warn!("SSH connect to {} failed: {}", host_name, error);
+            return ResolvedHostScan {
+                host: host_name.to_string(),
+                connected: false,
+                error: Some(error.to_string()),
+                completed_unix_ms: current_unix_ms(),
+                sessions: vec![],
+            };
+        }
+    }
+
+    let scan = remote::scan_remote_v2(ssh_manager, host_name).await;
+    resolve_host_scan(host_name, &scan, true, None).await
+}
+
+async fn resolve_host_scan(
+    host: &str,
+    scan: &ScanResult,
+    connected: bool,
+    error: Option<String>,
+) -> ResolvedHostScan {
+    let statuses = if let Some(port) = scan.server_port {
+        let base_url = format!("http://localhost:{}", port);
+        match OcClient::new(&base_url) {
+            Ok(client) => client.get_session_statuses().await.ok(),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let sessions = scan
+        .active_sessions
+        .iter()
+        .map(|active| resolve_active_session(host, active, scan.server_port, statuses.as_ref()))
+        .collect();
+
+    ResolvedHostScan {
+        host: host.to_string(),
+        connected,
+        error,
+        completed_unix_ms: current_unix_ms(),
+        sessions,
+    }
+}
+
+fn resolve_active_session(
+    host: &str,
+    active: &ActiveSession,
+    server_port: Option<u16>,
+    statuses: Option<&HashMap<String, crate::opencode::client::OcSessionStatus>>,
+) -> ResolvedSession {
+    let inferred_state = active.inferred_state.clone();
+    let state = match statuses {
+        Some(statuses) => {
+            let api_state = statuses
+                .get(&active.session_id)
+                .and_then(|status| status.status.as_deref())
+                .map(SessionState::from_oc_str);
+
+            match api_state {
+                Some(SessionState::Unknown) | None => {
+                    inferred_state.unwrap_or(SessionState::Unknown)
+                }
+                Some(state) => state,
+            }
+        }
+        None => inferred_state.unwrap_or(SessionState::Unknown),
+    };
+
+    let oc_port = server_port.unwrap_or(0);
+    let oc_base_url = format!("http://localhost:{}", oc_port);
+    let activity_age_secs = current_unix_ms().saturating_sub(active.time_updated_ms) / 1000;
+
+    ResolvedSession {
+        info: SessionInfo {
+            id: active.session_id.clone(),
+            host: host.to_string(),
+            state,
+            parent_id: active.parent_id.clone(),
+            title: active.title.clone(),
+            working_dir: active.directory.clone(),
+            activity_age_secs,
+            oc_port,
+            tmux_session: active.tmux_session.clone(),
+            tmux_window: active.tmux_window.clone(),
+            tmux_pane: active.tmux_pane_index.map(|index| index.to_string()),
+        },
+        oc_base_url,
+        last_seen_unix_ms: active.time_updated_ms,
     }
 }
 
