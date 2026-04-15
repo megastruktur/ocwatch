@@ -110,7 +110,7 @@ impl DaemonCore {
             self.config.poll_interval_secs as u64,
         ));
         poll_interval.tick().await;
-        self.request_scan_cycle(&scan_cmd_tx);
+        let _ = self.request_scan_cycle(&scan_cmd_tx);
 
         let mut sigterm = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
@@ -157,7 +157,7 @@ impl DaemonCore {
 
                             if self.rescan_requested {
                                 self.rescan_requested = false;
-                                self.request_scan_cycle(&scan_cmd_tx);
+                                let _ = self.request_scan_cycle(&scan_cmd_tx);
                             }
                         }
                         None => {
@@ -165,6 +165,7 @@ impl DaemonCore {
                             let should_resume_scan = self.scan_in_progress
                                 || self.rescan_requested
                                 || !self.pending_refresh_responders.is_empty();
+                            self.fail_refresh_responders("Refresh aborted because the scan worker stopped");
                             self.scan_in_progress = false;
                             let (new_tx, new_rx, new_worker) = spawn_scan_worker(self.config.clone());
                             scan_cmd_tx = new_tx;
@@ -173,13 +174,13 @@ impl DaemonCore {
 
                             if should_resume_scan {
                                 self.rescan_requested = false;
-                                self.request_scan_cycle(&scan_cmd_tx);
+                                let _ = self.request_scan_cycle(&scan_cmd_tx);
                             }
                         }
                     }
                 }
                 _ = poll_interval.tick() => {
-                    self.request_scan_cycle(&scan_cmd_tx);
+                    let _ = self.request_scan_cycle(&scan_cmd_tx);
                 }
             }
         }
@@ -191,12 +192,12 @@ impl DaemonCore {
         Ok(())
     }
 
-    fn request_scan_cycle(&mut self, scan_cmd_tx: &UnboundedSender<ScanWorkerCommand>) {
+    fn request_scan_cycle(&mut self, scan_cmd_tx: &UnboundedSender<ScanWorkerCommand>) -> bool {
         self.ensure_host_placeholders();
 
         if self.scan_in_progress {
             self.rescan_requested = true;
-            return;
+            return true;
         }
 
         self.scan_in_progress = true;
@@ -205,7 +206,10 @@ impl DaemonCore {
         if scan_cmd_tx.send(ScanWorkerCommand::StartCycle).is_err() {
             self.scan_in_progress = false;
             tracing::error!("Failed to schedule scan cycle: scan worker channel closed");
+            return false;
         }
+
+        true
     }
 
     fn schedule_refresh(
@@ -217,7 +221,12 @@ impl DaemonCore {
             self.rescan_requested = true;
             self.active_scan_generation + 1
         } else {
-            self.request_scan_cycle(scan_cmd_tx);
+            if !self.request_scan_cycle(scan_cmd_tx) {
+                let _ = responder.send(DaemonMessage::Error {
+                    message: "Failed to start refresh scan".to_string(),
+                });
+                return;
+            }
             self.active_scan_generation
         };
 
@@ -342,6 +351,14 @@ impl DaemonCore {
         }
 
         self.pending_refresh_responders = remaining;
+    }
+
+    fn fail_refresh_responders(&mut self, message: &str) {
+        for (_, responder) in self.pending_refresh_responders.drain(..) {
+            let _ = responder.send(DaemonMessage::Error {
+                message: message.to_string(),
+            });
+        }
     }
 
 
@@ -752,10 +769,19 @@ impl DaemonCore {
                 let (refresh_tx, refresh_rx) = oneshot::channel();
                 self.schedule_refresh(scan_cmd_tx, refresh_tx);
                 tokio::spawn(async move {
-                    if let Ok(snapshot) = refresh_rx.await {
-                        let _ = ipc::send_message(&mut write_half, &snapshot).await;
-                    }
+                    let response = match tokio::time::timeout(Duration::from_secs(30), refresh_rx).await {
+                        Ok(Ok(snapshot)) => snapshot,
+                        Ok(Err(_)) => DaemonMessage::Error {
+                            message: "Refresh failed before a fresh snapshot was available".to_string(),
+                        },
+                        Err(_) => DaemonMessage::Error {
+                            message: "Refresh timed out waiting for a fresh snapshot".to_string(),
+                        },
+                    };
+
+                    let _ = ipc::send_message(&mut write_half, &response).await;
                 });
+                return;
             }
             ClientMessage::GetRecentDirs { limit } => {
                 let missing_hosts = self.has_missing_recent_dir_hosts();
